@@ -65,6 +65,17 @@ reporter.to_json("board_data.json")
 
 ---
 
+## AI Agent Integration
+
+PCBsight works out of the box with modern AI coding assistants:
+
+- **Claude Code**: Supported via `CLAUDE.md`, `.claude/commands/pcbsight.md` (`/pcbsight`), and `.claude/skills/`.
+- **OpenAI Codex / Copilot**: Supported via `CODEX.md` and `.codex/skills/`.
+- **Google Antigravity & Cross-Agent Tools**: Supported via `AGENTS.md` and `.agents/skills/pcbsight/` (`SKILL.md`).
+
+---
+
 ## License
 
 MIT
+
