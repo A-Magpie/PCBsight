@@ -1,0 +1,22 @@
+{
+  "name": "pcbsight",
+  "displayName": "PCBsight Altium Analyzer",
+  "version": "1.0.0",
+  "description": "Comprehensive inspection, parsing, and analysis of Altium Designer .PcbDoc files. Extracts layers, tracks, silkscreen markings, dimensions, clearance rules, DRC violations, BOM, and components.",
+  "author": {
+    "name": "A-Magpie"
+  },
+  "repository": "https://github.com/A-Magpie/PCBsight",
+  "license": "MIT",
+  "keywords": [
+    "altium",
+    "pcbdoc",
+    "pcb",
+    "electronics",
+    "hardware",
+    "clearance",
+    "drc",
+    "layers",
+    "bom"
+  ]
+}
