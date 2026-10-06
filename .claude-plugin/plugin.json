@@ -1,8 +1,20 @@
 {
   "name": "pcbsight",
-  "displayName": "PCBsight Altium Analyzer",
   "version": "1.0.0",
+  "displayName": "PCBsight Altium Analyzer",
   "description": "Comprehensive inspection, parsing, and analysis of Altium Designer .PcbDoc files. Extracts layers, tracks, silkscreen markings, dimensions, clearance rules, DRC violations, BOM, and components.",
+  "interface": {
+    "displayName": "PCBsight Altium Analyzer",
+    "shortDescription": "Inspect, parse, and analyze Altium Designer .PcbDoc files.",
+    "longDescription": "Comprehensive inspection and analysis for Altium Designer .PcbDoc files. Extracts board outline, dimensions, full layer stackup, copper tracks, silkscreen markings, design rules, clearance constraints, DRC violations, drill schedule, and Bill of Materials.",
+    "developerName": "A-Magpie",
+    "category": "developer-tools",
+    "capabilities": [
+      "read_files",
+      "execute_code",
+      "run_terminal_commands"
+    ]
+  },
   "author": {
     "name": "A-Magpie"
   },
