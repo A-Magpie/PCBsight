@@ -1,0 +1,4302 @@
+"""
+Dedicated PcbLib builder for programmatic library creation.
+
+This path is intentionally separate from any PcbDoc-derived writer logic.
+The default builder profile is code-owned and template-free at runtime, while
+all output streams are constructed by dedicated builder code.
+"""
+
+from __future__ import annotations
+
+import copy
+import re
+import struct
+import uuid
+import zlib
+from datetime import datetime
+from dataclasses import dataclass, field, replace
+from enum import StrEnum
+from pathlib import Path
+from typing import Sequence
+
+from .altium_pcblib_defaults import DEFAULT_PCBLIB_FILE_HEADER_MAGIC
+from .altium_pcblib_defaults import DEFAULT_PCBLIB_PAD_VIA_LIBRARY_GUID
+from .altium_pcblib_defaults import build_default_pcblib_library_data_segments
+from .altium_pcb_stream_helpers import (
+    build_length_prefixed_ascii as _build_length_prefixed_ascii,
+)
+from .altium_pcb_stream_helpers import (
+    count_length_prefixed_records as _count_length_prefixed_records,
+)
+from .altium_pcb_stream_helpers import format_bool_text as _format_bool_text
+from .altium_pcb_stream_helpers import format_mil_value as _format_mil_value
+from .altium_pcb_stream_helpers import PcbKeyValueTextEntryMixin
+from .altium_pcblib_sections import PcbLibComponentParamsToc
+from .altium_pcblib_sections import PcbLibComponentParamsTocEntry
+from .altium_pcblib_sections import PcbLibCountHeader
+from .altium_pcblib_sections import PcbLibFileHeader
+from .altium_pcblib_sections import PcbLibFileVersionInfo
+from .altium_pcblib_sections import PcbLibLayerKindMapping
+from .altium_pcblib_sections import PcbLibPadViaLibrary
+from .altium_pcblib_sections import PcbLibSectionKeyEntry
+from .altium_pcblib_sections import PcbLibSectionKeys
+from .altium_ole import AltiumOleFile
+from .altium_pcb_custom_shapes import (
+    attach_custom_pad_shape,
+    build_pcblib_custom_pad_extended_info,
+    build_pcblib_custom_pad_region_properties,
+)
+from .altium_pcb_model_checksum import compute_altium_model_checksum
+from .altium_pcblib import (
+    AltiumPcbFootprint,
+    AltiumPcbLib,
+    _plan_pcblib_storage_names,
+    _footprint_parameter_signature,
+    _serialize_footprint_parameters,
+    _sync_footprint_primitive_parameter_stream,
+    _sync_footprint_via_structure_streams,
+)
+from .altium_pcb_pad_authoring import (
+    ROUND_HOLE_SHAPE,
+    SQUARE_HOLE_SHAPE,
+    SLOT_HOLE_SHAPE,
+    apply_authored_pad_local_stack,
+    apply_authored_pad_shape,
+    normalize_pad_hole_shape,
+    normalize_pad_shape,
+    validate_non_negative,
+)
+from .altium_pcb_mask_expansion import (
+    PcbMaskExpansionInput,
+    PcbMaskExpansionModeInput,
+    apply_pcb_mask_expansion_to_pad,
+    resolve_pcb_mask_expansion,
+    resolve_pcb_mask_expansion_with_legacy_alias,
+)
+from .altium_pcb_via_authoring import apply_authored_via_surface_policy
+from .altium_pcb_via_structure import (
+    AltiumPcbViaStructureFeature,
+    authored_via_structure_for_type,
+)
+from .altium_pcbdoc_builder_text import (
+    PCB_TEXT_BARCODE_MARGIN_MILS,
+    PCB_TEXT_BARCODE_MIN_WIDTH_MILS,
+    build_authored_text,
+)
+from .altium_pcbdoc_builder_regions import region_v7_layer_text
+from .altium_record_pcb__arc import AltiumPcbArc
+from .altium_pcb_enums import (
+    MechanicalLayerKind,
+    PCB_USER_MECHANICAL_LAYER_AUTHORING_MAX,
+    pcb_mechanical_layer_number_to_v7_saved_layer_id,
+    PcbBarcodeKind,
+)
+from .altium_pcb_enums import PcbBarcodeRenderMode
+from .altium_pcb_enums import PcbBodyProjection
+from .altium_pcb_enums import PcbIpc4761ViaType
+from .altium_pcb_enums import PcbRegionKind
+from .altium_pcb_enums import pcb_region_kind_from_native_kind
+from .altium_pcb_enums import pcb_region_kind_to_native_kind
+from .altium_record_pcb__component_body import AltiumPcbComponentBody
+from .altium_record_pcb__fill import AltiumPcbFill
+from .altium_record_pcb__model import AltiumPcbModel
+from .altium_pcb_enums import PadHoleShape
+from .altium_pcb_enums import PadShape
+from .altium_pcb_layer_kind_mapping import coerce_mechanical_layer_kind
+from .altium_pcb_layer_kind_mapping import mechanical_layer_kind_to_data_token
+from .altium_pcb_layer_kind_mapping import (
+    authored_mechanical_layer_row_id,
+    mechanical_layer_number_to_legacy_layer_id,
+    mechanical_layer_v8_index,
+    mechanical_layer_v9_cache_index,
+)
+from .altium_pcb_layer_kind_mapping import mechanical_layer_set_token
+from .altium_pcb_layer_kind_mapping import split_layer_set_nonmechanical_parts
+from .altium_pcb_layer_ref import (
+    PcbLayerFamily,
+    PcbLayerLike,
+    PcbLayerRef,
+    PcbLayerResolutionError,
+    _coerce_pcb_authoring_layer_storage,
+    _coerce_region_authoring_layer_storage,
+    _coerce_pcb_pad_authoring_layer_storage,
+    _coerce_pcb_via_span_layer_storage,
+)
+from .altium_record_pcb__pad import AltiumPcbPad
+from .altium_record_pcb__region import AltiumPcbRegion, RegionVertex
+from .altium_record_pcb__shapebased_region import (
+    AltiumPcbShapeBasedRegion,
+    PcbExtendedVertex,
+)
+from .altium_record_pcb__text import AltiumPcbText
+from .altium_record_pcb__track import AltiumPcbTrack
+from .altium_record_pcb__via import AltiumPcbVia
+from .altium_record_types import PcbLayer, generate_unique_id
+from .altium_text_codec import decode_altium_ansi, encode_altium_ansi_lossy
+
+_PAD_SUBRECORD2_DEFAULT = b"\x00"
+_PAD_SUBRECORD3_DEFAULT = b"\x04|&|0"
+_PAD_SUBRECORD4_DEFAULT = b"\x00"
+
+
+def _build_library_data(header_bytes: bytes, footprint_names: list[str]) -> bytes:
+    buf = bytearray()
+    buf.extend(struct.pack("<I", len(header_bytes)))
+    buf.extend(header_bytes)
+    buf.extend(struct.pack("<I", len(footprint_names)))
+    for name in footprint_names:
+        name_bytes = name.encode("utf-8", errors="replace")
+        subrecord = bytes([len(name_bytes)]) + name_bytes
+        buf.extend(struct.pack("<I", len(subrecord)))
+        buf.extend(subrecord)
+    return bytes(buf)
+
+
+def _build_footprint_parameters(spec: "PcbLibFootprintSpec") -> bytes:
+    parameters = dict(spec.footprint.parameters)
+    parameters.update(
+        {
+            "PATTERN": spec.footprint.name,
+            "HEIGHT": spec.height,
+            "DESCRIPTION": spec.description,
+            "ITEMGUID": spec.item_guid,
+            "REVISIONGUID": spec.revision_guid,
+        }
+    )
+    spec.footprint.parameters = parameters
+    spec.footprint._parameter_signature = _footprint_parameter_signature(spec.footprint)
+    return _serialize_footprint_parameters(parameters)
+
+
+def _build_footprint_widestrings(strings: dict[int, str] | None = None) -> bytes:
+    if not strings:
+        return _build_length_prefixed_ascii("\x00")
+
+    parts = []
+    for index, text in sorted(strings.items()):
+        csv = ",".join(str(ord(ch)) for ch in text)
+        parts.append(f"ENCODEDTEXT{index}={csv}")
+    return _build_length_prefixed_ascii("|" + "|".join(parts) + "\x00")
+
+
+def _build_primitive_guid_record(type_id: int, index: int, guid: uuid.UUID) -> bytes:
+    return struct.pack("<II", type_id, index) + guid.bytes_le
+
+
+def _import_primitive_guid_records(
+    spec: "PcbLibFootprintSpec",
+    data: bytes | None,
+) -> None:
+    if data is None or len(data) % 24 != 0:
+        return
+    for offset in range(0, len(data), 24):
+        type_id, index = struct.unpack("<II", data[offset : offset + 8])
+        guid = uuid.UUID(bytes_le=data[offset + 8 : offset + 24])
+        if type_id == 0x55 and index == 0:
+            spec.component_guid = guid
+        elif index < len(spec.footprint._record_order):
+            primitive = spec.footprint._record_order[index]
+            if PcbLibBuilder._primitive_guid_type_id(primitive) == type_id:
+                spec.primitive_guids[primitive] = guid
+
+
+def _import_primitive_unique_id_records(
+    spec: "PcbLibFootprintSpec",
+    data: bytes | None,
+) -> None:
+    if data is None:
+        return
+    offset = 0
+    while offset + 4 <= len(data):
+        length = struct.unpack("<I", data[offset : offset + 4])[0]
+        end = offset + 4 + length
+        if end > len(data):
+            return
+        try:
+            body = data[offset + 4 : end].decode("ascii").rstrip("\x00")
+        except UnicodeDecodeError:
+            return
+        fields = dict(pair.split("=", 1) for pair in body.split("|") if "=" in pair)
+        try:
+            index = int(fields["PRIMITIVEINDEX"])
+            unique_id = fields["UNIQUEID"]
+        except (KeyError, ValueError):
+            return
+        if index < len(spec.footprint._record_order):
+            primitive = spec.footprint._record_order[index]
+            if isinstance(primitive, AltiumPcbPad):
+                spec.primitive_unique_ids[primitive] = unique_id
+        offset = end
+
+
+def _strip_record_terminator(value: str | None) -> str | None:
+    if value is None:
+        return None
+    return value.rstrip("\r")
+
+
+@dataclass(frozen=True)
+class PcbLibLibraryDataSegment(PcbKeyValueTextEntryMixin):
+    raw: str
+
+
+@dataclass(frozen=True)
+class PcbLibLibraryDataRecord:
+    record_type: str
+    segments: tuple[PcbLibLibraryDataSegment, ...]
+    start_index: int
+    end_index: int
+
+    @property
+    def property_segments(self) -> tuple[PcbLibLibraryDataSegment, ...]:
+        return self.segments[1:]
+
+    def get_value(
+        self, key: str, default: str | None = None, occurrence: int = 0
+    ) -> str | None:
+        seen = 0
+        for segment in self.property_segments:
+            if segment.key != key:
+                continue
+            if seen == occurrence:
+                return segment.value
+            seen += 1
+        return default
+
+    def with_updated_value(
+        self, key: str, value: str, occurrence: int = 0
+    ) -> "PcbLibLibraryDataRecord":
+        seen = 0
+        updated = False
+        new_segments: list[PcbLibLibraryDataSegment] = []
+        for segment in self.segments:
+            if segment.key == key and seen == occurrence:
+                new_segments.append(PcbLibLibraryDataSegment(raw=f"{key}={value}"))
+                updated = True
+            else:
+                new_segments.append(segment)
+            if segment.key == key:
+                seen += 1
+
+        if not updated:
+            raise KeyError(f"Record key not found: {key}")
+
+        return PcbLibLibraryDataRecord(
+            record_type=self.record_type,
+            segments=tuple(new_segments),
+            start_index=self.start_index,
+            end_index=self.end_index,
+        )
+
+
+@dataclass(frozen=True)
+class PcbLibNestedConfig:
+    segments: tuple[PcbLibLibraryDataSegment, ...]
+    leading_backtick: bool = True
+
+    @classmethod
+    def from_value(cls, value: str) -> "PcbLibNestedConfig":
+        leading_backtick = value.startswith("`")
+        if leading_backtick:
+            value = value[1:]
+        return cls(
+            segments=tuple(
+                PcbLibLibraryDataSegment(raw=part) for part in value.split("`")
+            ),
+            leading_backtick=leading_backtick,
+        )
+
+    def serialize(self) -> str:
+        text = "`".join(segment.raw for segment in self.segments)
+        if self.leading_backtick:
+            text = "`" + text
+        return text
+
+    def get_value(
+        self, key: str, default: str | None = None, occurrence: int = 0
+    ) -> str | None:
+        seen = 0
+        for segment in self.segments:
+            if segment.key != key:
+                continue
+            if seen == occurrence:
+                return segment.value
+            seen += 1
+        return default
+
+    def with_updated_value(
+        self, key: str, value: str, occurrence: int = 0
+    ) -> "PcbLibNestedConfig":
+        seen = 0
+        updated = False
+        new_segments: list[PcbLibLibraryDataSegment] = []
+        for segment in self.segments:
+            if segment.key == key and seen == occurrence:
+                new_segments.append(PcbLibLibraryDataSegment(raw=f"{key}={value}"))
+                updated = True
+            else:
+                new_segments.append(segment)
+            if segment.key == key:
+                seen += 1
+
+        if not updated:
+            raise KeyError(f"Nested config key not found: {key}")
+
+        return PcbLibNestedConfig(
+            segments=tuple(new_segments),
+            leading_backtick=self.leading_backtick,
+        )
+
+
+@dataclass(frozen=True)
+class PcbLibLibraryMetadata:
+    filename: str | None = None
+    kind: str | None = None
+    version: str | None = None
+    date: str | None = None
+    time: str | None = None
+
+
+class PcbLibViewState(StrEnum):
+    TWO_D = "2D"
+    THREE_D = "3D"
+
+    @classmethod
+    def from_text(cls, value: str | None) -> "PcbLibViewState | None":
+        if value is None:
+            return None
+        normalized = _strip_record_terminator(value)
+        if normalized is None:
+            return None
+        try:
+            return cls(normalized.upper())
+        except ValueError:
+            return None
+
+
+@dataclass(frozen=True)
+class PcbLibViewport:
+    low_x: str
+    high_x: str
+    low_y: str
+    high_y: str
+
+
+@dataclass(frozen=True)
+class PcbLibConfigurationBlock:
+    nested_config: PcbLibNestedConfig
+    configuration_kind: str | None = None
+    configuration_description: str | None = None
+
+    @classmethod
+    def from_nested_config(
+        cls,
+        nested_config: PcbLibNestedConfig,
+    ) -> "PcbLibConfigurationBlock":
+        return cls(
+            nested_config=nested_config,
+            configuration_kind=nested_config.get_value("CFGALL.CONFIGURATIONKIND"),
+            configuration_description=nested_config.get_value(
+                "CFGALL.CONFIGURATIONDESC"
+            ),
+        )
+
+    def to_nested_config(self) -> PcbLibNestedConfig:
+        updated = self.nested_config
+        if self.configuration_kind is not None:
+            updated = updated.with_updated_value(
+                "CFGALL.CONFIGURATIONKIND",
+                self.configuration_kind,
+            )
+        if self.configuration_description is not None:
+            updated = updated.with_updated_value(
+                "CFGALL.CONFIGURATIONDESC",
+                self.configuration_description,
+            )
+        return updated
+
+
+@dataclass(frozen=True)
+class PcbLibViewConfiguration:
+    config_type: str | None
+    full_filename: str | None
+    configuration: PcbLibConfigurationBlock | None
+
+
+def _parse_bool_text(value: str | None) -> bool | None:
+    if value is None:
+        return None
+    normalized = _strip_record_terminator(value)
+    if normalized is None:
+        return None
+    return normalized.upper() == "TRUE"
+
+
+def _parse_int_text(value: str | None) -> int | None:
+    if value is None:
+        return None
+    normalized = _strip_record_terminator(value)
+    if normalized in (None, ""):
+        return None
+    return int(normalized)
+
+
+def _parse_float_text(value: str | None) -> float | None:
+    if value is None:
+        return None
+    normalized = _strip_record_terminator(value)
+    if normalized in (None, ""):
+        return None
+    return float(normalized)
+
+
+def _format_fixed_float(value: float, places: int = 6) -> str:
+    return f"{value:.{places}f}"
+
+
+def _parse_bool_mask_text(value: str | None) -> tuple[bool, ...] | None:
+    if value is None:
+        return None
+    normalized = _strip_record_terminator(value)
+    if normalized in (None, ""):
+        return None
+    return tuple(ch == "1" for ch in normalized)
+
+
+def _format_bool_mask_text(values: tuple[bool, ...]) -> str:
+    return "".join("1" if value else "0" for value in values)
+
+
+def _parse_float_series_text(
+    value: str | None,
+    *,
+    delimiter: str = "?",
+) -> tuple[float, ...] | None:
+    if value is None:
+        return None
+    normalized = _strip_record_terminator(value)
+    if normalized in (None, ""):
+        return None
+    parts = [part for part in normalized.split(delimiter) if part != ""]
+    return tuple(float(part) for part in parts)
+
+
+def _format_float_series_text(
+    values: tuple[float, ...],
+    *,
+    delimiter: str = "?",
+    places: int = 2,
+) -> str:
+    if not values:
+        return ""
+    return delimiter.join(f"{value:.{places}f}" for value in values) + delimiter
+
+
+@dataclass(frozen=True)
+class PcbLibGridSettings:
+    big_visible_grid_size: float
+    visible_grid_size: float
+    snap_grid_size: float
+    snap_grid_size_x: float
+    snap_grid_size_y: float
+    electrical_grid_range: str
+    electrical_grid_enabled: bool
+    dot_grid: bool
+    dot_grid_large: bool
+    display_unit: int
+
+
+@dataclass(frozen=True)
+class PcbLibCameraSettings:
+    look_at_x: float
+    look_at_y: float
+    look_at_z: float
+    eye_rotation_x: float
+    eye_rotation_y: float
+    eye_rotation_z: float
+    zoom_multiplier: float
+    view_size_x: int
+    view_size_y: int
+    electrical_grid_range: str
+    electrical_grid_multiplier: float
+    electrical_grid_enabled: bool
+    electrical_grid_snap_to_board_outline: bool
+    electrical_grid_snap_to_arc_centers: bool
+    electrical_grid_use_all_layers: bool
+    object_guide_snap_enabled: bool
+    midpoint_guide_snap_enabled: bool
+    point_guide_enabled: bool
+    grid_snap_enabled: bool
+    near_objects_enabled: bool
+    far_objects_enabled: bool
+
+
+@dataclass(frozen=True)
+class PcbLib2DViewSettings:
+    current_layer: str | None = None
+    display_special_strings: bool | None = None
+    show_test_points: bool | None = None
+    show_origin_marker: bool | None = None
+    eye_distance: int | None = None
+    show_status_info: bool | None = None
+    show_pad_nets: bool | None = None
+    show_pad_numbers: bool | None = None
+    show_via_nets: bool | None = None
+    show_via_span: bool | None = None
+    use_transparent_layers: bool | None = None
+    plane_draw_mode: int | None = None
+    single_layer_mode_state: int | None = None
+
+
+@dataclass(frozen=True)
+class PcbLib3DViewSettings:
+    show_component_bodies: bool | None = None
+    show_component_step_models: bool | None = None
+    component_model_preference: int | None = None
+    show_component_axes: bool | None = None
+    show_board_core: bool | None = None
+    show_board_prepreg: bool | None = None
+    show_top_silkscreen: bool | None = None
+    show_bottom_silkscreen: bool | None = None
+    show_origin_marker: bool | None = None
+    eye_distance: int | None = None
+    show_cutouts: bool | None = None
+    show_route_tool_path: bool | None = None
+    show_rooms_3d: bool | None = None
+    use_system_colors: bool | None = None
+
+
+@dataclass(frozen=True)
+class PcbLibLayerOpacityEntry:
+    layer_name: str
+    values: tuple[float, ...]
+
+
+@dataclass(frozen=True)
+class PcbLibLayerOpacityTable:
+    entries: tuple[PcbLibLayerOpacityEntry, ...]
+
+    def entry(self, layer_name: str) -> PcbLibLayerOpacityEntry | None:
+        return next(
+            (entry for entry in self.entries if entry.layer_name == layer_name), None
+        )
+
+
+@dataclass(frozen=True)
+class PcbLibToggleLayerSettings:
+    toggle_layers: tuple[bool, ...]
+    toggle_layers_set: str | None
+    all_connections_in_single_layer_mode: bool | None
+    mechanical_layers_in_single_layer_mode: tuple[bool, ...]
+    mechanical_layers_in_single_layer_mode_set: str | None
+    mechanical_layers_linked_to_sheet: tuple[bool, ...]
+    mechanical_layers_linked_to_sheet_set: str | None
+    mechanical_cover_layer_updated: bool | None
+
+
+@dataclass(frozen=True)
+class PcbLibLayerSet:
+    index: int
+    name: str
+    layers: tuple[str, ...]
+    active_layer: str
+    is_current: bool
+    is_locked: bool
+    flip_board: bool
+
+
+@dataclass(frozen=True)
+class PcbLibLayerSets:
+    sets: tuple[PcbLibLayerSet, ...]
+
+    def layer_set(self, index: int) -> PcbLibLayerSet | None:
+        return next((entry for entry in self.sets if entry.index == index), None)
+
+
+_LAYER_ENTRY_FIELDS = (
+    "NAME",
+    "PREV",
+    "NEXT",
+    "MECHENABLED",
+    "COPTHICK",
+    "DIELTYPE",
+    "DIELCONST",
+    "DIELHEIGHT",
+    "DIELMATERIAL",
+)
+_LEGACY_LAYER_KEY_RE = re.compile(
+    r"^LAYER(\d+)(NAME|PREV|NEXT|MECHENABLED|COPTHICK|DIELTYPE|DIELCONST|DIELHEIGHT|DIELMATERIAL)$"
+)
+_V7_LAYER_KEY_RE = re.compile(
+    r"^LAYERV7_(\d+)(LAYERID|NAME|PREV|NEXT|MECHENABLED|COPTHICK|DIELTYPE|DIELCONST|DIELHEIGHT|DIELMATERIAL)$"
+)
+_LAYER_V8_KEY_RE = re.compile(r"^LAYER_V8_(\d+)(.+)$", re.IGNORECASE)
+_V9_CACHE_LAYER_KEY_RE = re.compile(r"^V9_CACHE_LAYER(\d+)_(.+)$", re.IGNORECASE)
+_LAYER_OPACITY_KEY_RE = re.compile(r"^CFG2D\.LAYEROPACITY\.(.+)$")
+_LAYER_SET_KEY_RE = re.compile(
+    r"^LAYERSET(\d+)(NAME|LAYERS|ACTIVELAYER\.7|ISCURRENT|ISLOCKED|FLIPBOARD)$"
+)
+
+
+def mechanical_layer_kind_to_pcblib_token(
+    kind: int | str | MechanicalLayerKind,
+) -> str:
+    """Return the `Library/Data` MECHKIND token used by Altium PcbLib files."""
+
+    return mechanical_layer_kind_to_data_token(kind)
+
+
+def _coerce_mechanical_layer_number(layer: int | str | PcbLayer) -> int:
+    max_layer = PCB_USER_MECHANICAL_LAYER_AUTHORING_MAX
+    if isinstance(layer, PcbLayer):
+        layer_id = int(layer)
+        if PcbLayer.MECHANICAL_1.value <= layer_id <= PcbLayer.MECHANICAL_16.value:
+            return layer_id - PcbLayer.MECHANICAL_1.value + 1
+        raise ValueError(f"Layer is not Mechanical 1..{max_layer}: {layer!r}")
+    if isinstance(layer, int):
+        value = int(layer)
+        if PcbLayer.MECHANICAL_1.value <= value <= PcbLayer.MECHANICAL_16.value:
+            return value - PcbLayer.MECHANICAL_1.value + 1
+        if 1 <= value <= max_layer:
+            return value
+        raise ValueError(f"Layer is not Mechanical 1..{max_layer}: {layer!r}")
+
+    token = "".join(ch for ch in str(layer or "").upper() if ch.isalnum())
+    if token.isdigit():
+        value = int(token)
+        if PcbLayer.MECHANICAL_1.value <= value <= PcbLayer.MECHANICAL_16.value:
+            return value - PcbLayer.MECHANICAL_1.value + 1
+        if 1 <= value <= max_layer:
+            return value
+        raise ValueError(f"Layer is not Mechanical 1..{max_layer}: {layer!r}")
+    if token.startswith("MECHANICAL"):
+        suffix = token.removeprefix("MECHANICAL")
+        if suffix.isdigit():
+            value = int(suffix)
+            if 1 <= value <= max_layer:
+                return value
+        raise ValueError(f"Layer is not Mechanical 1..{max_layer}: {layer!r}")
+    try:
+        parsed = int(PcbLayer.from_json_name(token))
+    except ValueError as exc:
+        raise ValueError(f"Unsupported mechanical layer: {layer!r}") from exc
+    if PcbLayer.MECHANICAL_1.value <= parsed <= PcbLayer.MECHANICAL_16.value:
+        return parsed - PcbLayer.MECHANICAL_1.value + 1
+    raise ValueError(f"Layer is not Mechanical 1..{max_layer}: {layer!r}")
+
+
+@dataclass(frozen=True)
+class PcbLibLegacyLayerEntry:
+    layer_number: int
+    name: str
+    previous_layer: int
+    next_layer: int
+    mechanical_enabled: bool
+    copper_thickness: str
+    dielectric_type: int
+    dielectric_constant: str
+    dielectric_height: str
+    dielectric_material: str
+
+
+@dataclass(frozen=True)
+class PcbLibV7LayerEntry:
+    index: int
+    layer_id: int
+    name: str
+    previous_layer: int
+    next_layer: int
+    mechanical_enabled: bool
+    copper_thickness: str
+    dielectric_type: int
+    dielectric_constant: str
+    dielectric_height: str
+    dielectric_material: str
+
+
+@dataclass(frozen=True)
+class PcbLibLayerTable:
+    legacy_layers: tuple[PcbLibLegacyLayerEntry, ...]
+    v7_layers: tuple[PcbLibV7LayerEntry, ...]
+
+    def legacy_layer(self, layer_number: int) -> PcbLibLegacyLayerEntry | None:
+        return next(
+            (
+                entry
+                for entry in self.legacy_layers
+                if entry.layer_number == layer_number
+            ),
+            None,
+        )
+
+    def v7_layer(self, index: int) -> PcbLibV7LayerEntry | None:
+        return next((entry for entry in self.v7_layers if entry.index == index), None)
+
+    def v7_layer_by_layer_id(self, layer_id: int) -> PcbLibV7LayerEntry | None:
+        return next(
+            (entry for entry in self.v7_layers if entry.layer_id == int(layer_id)),
+            None,
+        )
+
+
+_PCBLIB_V7_MECHANICAL_PREV_NEXT_LAYER_ID = 16973824
+
+
+def _pcblib_v7_mechanical_number(layer_id: int) -> int | None:
+    first_v7_id = pcb_mechanical_layer_number_to_v7_saved_layer_id(1)
+    if first_v7_id is None:
+        return None
+    parsed_layer_id = int(layer_id)
+    if (parsed_layer_id & 0xFFFF0000) != (first_v7_id & 0xFFFF0000):
+        return None
+    number = parsed_layer_id - first_v7_id + 1
+    if number <= 0:
+        return None
+    return number
+
+
+def _pcblib_v7_layer_template_without_record_trivia(
+    entry: PcbLibV7LayerEntry,
+) -> PcbLibV7LayerEntry:
+    return replace(
+        entry,
+        name=entry.name.strip(),
+        copper_thickness=entry.copper_thickness.strip(),
+        dielectric_constant=entry.dielectric_constant.strip(),
+        dielectric_height=entry.dielectric_height.strip(),
+        dielectric_material=entry.dielectric_material.strip(),
+    )
+
+
+def _pcblib_v7_mechanical_row_template(
+    layer_table: PcbLibLayerTable,
+    target_v7_layer_id: int,
+) -> PcbLibV7LayerEntry:
+    candidates = tuple(
+        entry
+        for entry in layer_table.v7_layers
+        if _pcblib_v7_mechanical_number(entry.layer_id) is not None
+    )
+    if candidates:
+        return _pcblib_v7_layer_template_without_record_trivia(
+            min(
+                candidates,
+                key=lambda entry: (
+                    abs(entry.layer_id - target_v7_layer_id),
+                    entry.index,
+                ),
+            )
+        )
+    return PcbLibV7LayerEntry(
+        index=-1,
+        layer_id=target_v7_layer_id,
+        name="",
+        previous_layer=_PCBLIB_V7_MECHANICAL_PREV_NEXT_LAYER_ID,
+        next_layer=_PCBLIB_V7_MECHANICAL_PREV_NEXT_LAYER_ID,
+        mechanical_enabled=False,
+        copper_thickness="1.4mil",
+        dielectric_type=0,
+        dielectric_constant="4.800",
+        dielectric_height="12.6mil",
+        dielectric_material="FR-4",
+    )
+
+
+@dataclass(frozen=True)
+class PcbLibLibraryData:
+    """
+    Ordered representation of the large `Library/Data` text header blob.
+
+    This is not yet a fully semantic model of every field, but it is already a
+    synthesized composition path: parse into ordered segments, then rebuild the
+    exact byte stream from those segments plus the footprint catalog.
+    """
+
+    segments: tuple[PcbLibLibraryDataSegment, ...]
+    leading_pipe: bool = True
+    trailing_nul: bool = True
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "PcbLibLibraryData":
+        text = decode_altium_ansi(data)
+        trailing_nul = text.endswith("\x00")
+        if trailing_nul:
+            text = text[:-1]
+
+        leading_pipe = text.startswith("|")
+        if leading_pipe:
+            text = text[1:]
+
+        segments = tuple(PcbLibLibraryDataSegment(raw=part) for part in text.split("|"))
+        return cls(
+            segments=segments, leading_pipe=leading_pipe, trailing_nul=trailing_nul
+        )
+
+    @classmethod
+    def default(cls) -> "PcbLibLibraryData":
+        """Return the code-owned default Library/Data model for new PcbLib builds."""
+        return cls(
+            segments=tuple(
+                PcbLibLibraryDataSegment(raw=segment)
+                for segment in build_default_pcblib_library_data_segments()
+            ),
+            leading_pipe=True,
+            trailing_nul=True,
+        )
+
+    def serialize(self) -> bytes:
+        text = "|".join(segment.raw for segment in self.segments)
+        if self.leading_pipe:
+            text = "|" + text
+        if self.trailing_nul:
+            text += "\x00"
+        return encode_altium_ansi_lossy(text)
+
+    def build_stream(self, footprint_names: list[str]) -> bytes:
+        return _build_library_data(self.serialize(), footprint_names)
+
+    def _first_record_index(self) -> int | None:
+        for index, segment in enumerate(self.segments):
+            if segment.raw.startswith("RECORD="):
+                return index
+        return None
+
+    @property
+    def top_level_segments(self) -> tuple[PcbLibLibraryDataSegment, ...]:
+        first_record_index = self._first_record_index()
+        if first_record_index is None:
+            return self.segments
+        return self.segments[:first_record_index]
+
+    @property
+    def record_blocks(self) -> tuple[PcbLibLibraryDataRecord, ...]:
+        first_record_index = self._first_record_index()
+        if first_record_index is None:
+            return ()
+
+        records: list[PcbLibLibraryDataRecord] = []
+        current_start = first_record_index
+        for index in range(first_record_index + 1, len(self.segments)):
+            if self.segments[index].raw.startswith("RECORD="):
+                records.append(self._build_record(current_start, index))
+                current_start = index
+        records.append(self._build_record(current_start, len(self.segments)))
+        return tuple(records)
+
+    def _build_record(self, start: int, end: int) -> PcbLibLibraryDataRecord:
+        marker = self.segments[start].raw
+        record_type = marker.split("=", 1)[1] if "=" in marker else ""
+        return PcbLibLibraryDataRecord(
+            record_type=record_type,
+            segments=self.segments[start:end],
+            start_index=start,
+            end_index=end,
+        )
+
+    def get_value(
+        self, key: str, default: str | None = None, occurrence: int = 0
+    ) -> str | None:
+        seen = 0
+        for segment in self.top_level_segments:
+            if segment.key != key:
+                continue
+            if seen == occurrence:
+                return segment.value
+            seen += 1
+        return default
+
+    def with_updated_value(
+        self, key: str, value: str, occurrence: int = 0
+    ) -> "PcbLibLibraryData":
+        seen = 0
+        updated = False
+        new_segments: list[PcbLibLibraryDataSegment] = []
+        for segment in self.segments:
+            if segment.key == key and seen == occurrence:
+                new_segments.append(PcbLibLibraryDataSegment(raw=f"{key}={value}"))
+                updated = True
+            else:
+                new_segments.append(segment)
+            if segment.key == key:
+                seen += 1
+
+        if not updated:
+            raise KeyError(f"Library/Data key not found: {key}")
+
+        return PcbLibLibraryData(
+            segments=tuple(new_segments),
+            leading_pipe=self.leading_pipe,
+            trailing_nul=self.trailing_nul,
+        )
+
+    def with_basic_metadata(
+        self,
+        *,
+        filename: str | None = None,
+        kind: str | None = None,
+        version: str | None = None,
+        date: str | None = None,
+        time: str | None = None,
+    ) -> "PcbLibLibraryData":
+        updated = self
+        if filename is not None:
+            updated = updated.with_updated_value("FILENAME", filename)
+        if kind is not None:
+            updated = updated.with_updated_value("KIND", kind)
+        if version is not None:
+            updated = updated.with_updated_value("VERSION", version)
+        if date is not None:
+            updated = updated.with_updated_value("DATE", date)
+        if time is not None:
+            updated = updated.with_updated_value("TIME", time)
+        return updated
+
+    @property
+    def metadata(self) -> PcbLibLibraryMetadata:
+        return PcbLibLibraryMetadata(
+            filename=self.get_value("FILENAME"),
+            kind=self.get_value("KIND"),
+            version=self.get_value("VERSION"),
+            date=self.get_value("DATE"),
+            time=self.get_value("TIME"),
+        )
+
+    def with_metadata(self, metadata: PcbLibLibraryMetadata) -> "PcbLibLibraryData":
+        return self.with_basic_metadata(
+            filename=metadata.filename,
+            kind=metadata.kind,
+            version=metadata.version,
+            date=metadata.date,
+            time=metadata.time,
+        )
+
+    def with_output_metadata(
+        self, output_path: Path, when: datetime
+    ) -> "PcbLibLibraryData":
+        filename = str(output_path.resolve().with_suffix(".$$$"))
+        date = f"{when.month}/{when.day}/{when.year}"
+        hour12 = when.hour % 12 or 12
+        time = f"{hour12}:{when.minute:02d}:{when.second:02d} {'AM' if when.hour < 12 else 'PM'}"
+        return self.with_metadata(
+            PcbLibLibraryMetadata(
+                filename=filename,
+                date=date,
+                time=time,
+            )
+        )
+
+    def get_board_record(
+        self, key: str, occurrence: int = 0
+    ) -> PcbLibLibraryDataRecord | None:
+        seen = 0
+        for record in self.record_blocks:
+            if record.get_value(key) is None:
+                continue
+            if seen == occurrence:
+                return record
+            seen += 1
+        return None
+
+    def with_board_record_value(
+        self, key: str, value: str, occurrence: int = 0
+    ) -> "PcbLibLibraryData":
+        record = self.get_board_record(key, occurrence=occurrence)
+        if record is None:
+            raise KeyError(f"Board record key not found: {key}")
+        return self._replace_record(record.with_updated_value(key, value))
+
+    @property
+    def view_config_full_filenames(self) -> dict[str, str] | None:
+        keys = ("2DCONFIGFULLFILENAME", "3DCONFIGFULLFILENAME")
+        result: dict[str, str] = {}
+        for key in keys:
+            record = self.get_board_record(key)
+            if record is None:
+                continue
+            value = _strip_record_terminator(record.get_value(key))
+            if value is not None:
+                result[key] = value
+        return result or None
+
+    @property
+    def normalized_current_view_state(self) -> str | None:
+        return _strip_record_terminator(self.current_view_state)
+
+    @property
+    def view_state(self) -> PcbLibViewState | None:
+        return PcbLibViewState.from_text(self.current_view_state)
+
+    def with_view_state(self, state: PcbLibViewState) -> "PcbLibLibraryData":
+        return self.with_board_record_value("CURRENT2D3DVIEWSTATE", state.value)
+
+    def get_nested_config(
+        self, key: str, occurrence: int = 0
+    ) -> PcbLibNestedConfig | None:
+        record = self.get_board_record(key, occurrence=occurrence)
+        if record is None:
+            return None
+        value = record.get_value(key)
+        if value is None:
+            return None
+        return PcbLibNestedConfig.from_value(value)
+
+    def with_nested_config_value(
+        self,
+        record_key: str,
+        nested_key: str,
+        value: str,
+        occurrence: int = 0,
+    ) -> "PcbLibLibraryData":
+        record = self.get_board_record(record_key, occurrence=occurrence)
+        if record is None:
+            raise KeyError(f"Board record key not found: {record_key}")
+        nested = self.get_nested_config(record_key, occurrence=occurrence)
+        if nested is None:
+            raise KeyError(
+                f"Nested config not found for board record key: {record_key}"
+            )
+        updated_nested = nested.with_updated_value(nested_key, value)
+        return self._replace_record(
+            record.with_updated_value(record_key, updated_nested.serialize())
+        )
+
+    def _replace_record(
+        self, updated_record: PcbLibLibraryDataRecord
+    ) -> "PcbLibLibraryData":
+        new_segments = (
+            self.segments[: updated_record.start_index]
+            + updated_record.segments
+            + self.segments[updated_record.end_index :]
+        )
+        return PcbLibLibraryData(
+            segments=new_segments,
+            leading_pipe=self.leading_pipe,
+            trailing_nul=self.trailing_nul,
+        )
+
+    def _with_segment_value(
+        self,
+        key: str,
+        value: str,
+        *,
+        preferred_segment_key: str | None = None,
+    ) -> "PcbLibLibraryData":
+        new_segments: list[PcbLibLibraryDataSegment] = []
+        updated = False
+        insert_after_index: int | None = None
+        for segment in self.segments:
+            if segment.key == key and not updated:
+                new_segments.append(PcbLibLibraryDataSegment(raw=f"{key}={value}"))
+                updated = True
+            else:
+                new_segments.append(segment)
+            if (
+                preferred_segment_key is not None
+                and segment.key == preferred_segment_key
+            ):
+                insert_after_index = len(new_segments)
+
+        if not updated:
+            new_segment = PcbLibLibraryDataSegment(raw=f"{key}={value}")
+            if insert_after_index is None:
+                new_segments.append(new_segment)
+            else:
+                new_segments.insert(insert_after_index, new_segment)
+
+        return PcbLibLibraryData(
+            segments=tuple(new_segments),
+            leading_pipe=self.leading_pipe,
+            trailing_nul=self.trailing_nul,
+        )
+
+    def _segment_value(self, key: str) -> str | None:
+        for segment in self.segments:
+            if segment.key == key:
+                return segment.value
+        return None
+
+    def _indexed_layer_group(
+        self,
+        key_re: re.Pattern[str],
+        layer_id: int,
+    ) -> tuple[int, dict[str, int]] | None:
+        groups: dict[int, dict[str, int]] = {}
+        for index, segment in enumerate(self.segments):
+            key = segment.key or ""
+            match = key_re.match(key)
+            if match is None:
+                continue
+            group_index = int(match.group(1))
+            suffix = match.group(2).upper()
+            groups.setdefault(group_index, {})[suffix] = index
+
+        for group_index, positions in groups.items():
+            layer_id_index = positions.get("LAYERID")
+            if layer_id_index is None:
+                continue
+            if self.segments[layer_id_index].value == str(int(layer_id)):
+                return group_index, positions
+        return None
+
+    def _indexed_layer_field_value(
+        self,
+        key_re: re.Pattern[str],
+        layer_id: int,
+        field_name: str,
+    ) -> str | None:
+        group = self._indexed_layer_group(key_re, layer_id)
+        if group is None:
+            return None
+        _group_index, positions = group
+        field_index = positions.get(field_name.upper())
+        if field_index is None:
+            return None
+        return self.segments[field_index].value
+
+    def _with_indexed_layer_field(
+        self,
+        *,
+        key_re: re.Pattern[str],
+        layer_id: int,
+        field_name: str,
+        value: str,
+        key_prefix: str,
+        separator: str,
+    ) -> "PcbLibLibraryData":
+        group = self._indexed_layer_group(key_re, layer_id)
+        if group is None:
+            raise KeyError(f"Library/Data indexed layer not found: {layer_id}")
+        group_index, positions = group
+
+        field_key = f"{key_prefix}{group_index}{separator}{field_name.upper()}"
+        field_index = positions.get(field_name.upper())
+        new_segments = list(self.segments)
+        if field_index is not None:
+            new_segments[field_index] = PcbLibLibraryDataSegment(
+                raw=f"{field_key}={value}"
+            )
+        else:
+            preferred_suffixes = ("MECHENABLED", "USEDBYPRIMS", "LAYERID", "NAME")
+            insert_after = next(
+                (
+                    positions[suffix]
+                    for suffix in preferred_suffixes
+                    if suffix in positions
+                ),
+                max(positions.values()),
+            )
+            new_segments.insert(
+                insert_after + 1,
+                PcbLibLibraryDataSegment(raw=f"{field_key}={value}"),
+            )
+        return PcbLibLibraryData(
+            segments=tuple(new_segments),
+            leading_pipe=self.leading_pipe,
+            trailing_nul=self.trailing_nul,
+        )
+
+    @staticmethod
+    def _indexed_layer_fields_for_update(
+        field_values: dict[str, str],
+        positions: dict[str, int],
+    ) -> tuple[tuple[str, str], ...]:
+        selected: list[tuple[str, str]] = []
+        for field_name, value in field_values.items():
+            normalized_field = field_name.upper()
+            if normalized_field in {"NAME", "MECHENABLED"}:
+                selected.append((normalized_field, value))
+            elif normalized_field not in positions:
+                selected.append((normalized_field, value))
+        return tuple(selected)
+
+    @staticmethod
+    def _indexed_layer_insert_position(
+        *,
+        key_re: re.Pattern[str],
+        group_index: int,
+        segments: Sequence[PcbLibLibraryDataSegment],
+    ) -> int:
+        group_positions = [
+            (int(match.group(1)), segment_index)
+            for segment_index, segment in enumerate(segments)
+            if (match := key_re.match(segment.key or "")) is not None
+        ]
+        lower_positions = [
+            segment_index
+            for existing_index, segment_index in group_positions
+            if existing_index < group_index
+        ]
+        if lower_positions:
+            return max(lower_positions) + 1
+
+        higher_positions = [
+            segment_index
+            for existing_index, segment_index in group_positions
+            if existing_index > group_index
+        ]
+        if higher_positions:
+            return min(higher_positions)
+        return len(segments)
+
+    def _with_existing_indexed_layer_row(
+        self,
+        *,
+        key_re: re.Pattern[str],
+        layer_id: int,
+        positions: dict[str, int],
+        field_values: dict[str, str],
+        key_prefix: str,
+        separator: str,
+    ) -> "PcbLibLibraryData":
+        updated = self
+        for field_name, value in self._indexed_layer_fields_for_update(
+            field_values,
+            positions,
+        ):
+            updated = updated._with_indexed_layer_field(
+                key_re=key_re,
+                layer_id=layer_id,
+                field_name=field_name,
+                value=value,
+                key_prefix=key_prefix,
+                separator=separator,
+            )
+        return updated
+
+    def _with_indexed_layer_row(
+        self,
+        *,
+        key_re: re.Pattern[str],
+        group_index: int,
+        layer_id: int,
+        field_values: dict[str, str],
+        key_prefix: str,
+        separator: str,
+    ) -> "PcbLibLibraryData":
+        existing_group = self._indexed_layer_group(key_re, layer_id)
+        if existing_group is not None:
+            _group_index, positions = existing_group
+            return self._with_existing_indexed_layer_row(
+                key_re=key_re,
+                layer_id=layer_id,
+                positions=positions,
+                field_values=field_values,
+                key_prefix=key_prefix,
+                separator=separator,
+            )
+
+        group_key = f"{key_prefix}{int(group_index)}{separator}"
+        row_segments = tuple(
+            PcbLibLibraryDataSegment(raw=f"{group_key}{field_name.upper()}={value}")
+            for field_name, value in field_values.items()
+        )
+        insert_at = self._indexed_layer_insert_position(
+            key_re=key_re,
+            group_index=int(group_index),
+            segments=self.segments,
+        )
+        new_segments = list(self.segments)
+        new_segments[insert_at:insert_at] = row_segments
+        return PcbLibLibraryData(
+            segments=tuple(new_segments),
+            leading_pipe=self.leading_pipe,
+            trailing_nul=self.trailing_nul,
+        )
+
+    def mechanical_layer_kind_field_values(
+        self,
+        layer: int | str | PcbLayer,
+    ) -> dict[str, str | None]:
+        mechanical_number = _coerce_mechanical_layer_number(layer)
+        v7_layer_id = pcb_mechanical_layer_number_to_v7_saved_layer_id(
+            mechanical_number
+        )
+        if v7_layer_id is None:
+            raise ValueError(f"Unsupported mechanical layer: {layer!r}")
+
+        fields: dict[str, str | None] = {}
+        legacy_id = mechanical_layer_number_to_legacy_layer_id(mechanical_number)
+        if legacy_id is not None:
+            fields["legacy"] = self._segment_value(f"LAYER{legacy_id}MECHKIND")
+        else:
+            v7_entry = self.layer_table.v7_layer_by_layer_id(v7_layer_id)
+            fields["v7"] = (
+                None
+                if v7_entry is None
+                else self._segment_value(f"LAYERV7_{v7_entry.index}MECHKIND")
+            )
+        fields["layer_v8"] = self._indexed_layer_field_value(
+            _LAYER_V8_KEY_RE,
+            v7_layer_id,
+            "MECHKIND",
+        )
+        fields["v9_cache"] = self._indexed_layer_field_value(
+            _V9_CACHE_LAYER_KEY_RE,
+            v7_layer_id,
+            "MECHKIND",
+        )
+        return fields
+
+    def with_mechanical_layer_kind(
+        self,
+        layer: int | str | PcbLayer,
+        kind: int | str | MechanicalLayerKind,
+    ) -> "PcbLibLibraryData":
+        mechanical_number = _coerce_mechanical_layer_number(layer)
+        v7_layer_id = pcb_mechanical_layer_number_to_v7_saved_layer_id(
+            mechanical_number
+        )
+        if v7_layer_id is None:
+            raise ValueError(f"Unsupported mechanical layer: {layer!r}")
+
+        token = mechanical_layer_kind_to_pcblib_token(kind)
+        updated = self
+        legacy_id = mechanical_layer_number_to_legacy_layer_id(mechanical_number)
+        if legacy_id is not None:
+            updated = updated._with_segment_value(
+                f"LAYER{legacy_id}MECHKIND",
+                token,
+                preferred_segment_key=f"LAYER{legacy_id}MECHENABLED",
+            )
+        else:
+            v7_entry = updated.layer_table.v7_layer_by_layer_id(v7_layer_id)
+            if v7_entry is None:
+                raise KeyError(
+                    f"Mechanical layer not found in PcbLib V7 layer table: {layer!r}"
+                )
+            updated = updated._with_segment_value(
+                f"LAYERV7_{v7_entry.index}MECHKIND",
+                token,
+                preferred_segment_key=f"LAYERV7_{v7_entry.index}MECHENABLED",
+            )
+
+        updated = updated._with_indexed_layer_field(
+            key_re=_LAYER_V8_KEY_RE,
+            layer_id=v7_layer_id,
+            field_name="MECHKIND",
+            value=token,
+            key_prefix="LAYER_V8_",
+            separator="",
+        )
+        return updated._with_indexed_layer_field(
+            key_re=_V9_CACHE_LAYER_KEY_RE,
+            layer_id=v7_layer_id,
+            field_name="MECHKIND",
+            value=token,
+            key_prefix="V9_CACHE_LAYER",
+            separator="_",
+        )
+
+    def with_view_config_paths(
+        self,
+        *,
+        config_2d_full_filename: str | Path | None = None,
+        config_3d_full_filename: str | Path | None = None,
+        current_view_state: str | None = None,
+    ) -> "PcbLibLibraryData":
+        updated = self
+        if config_2d_full_filename is not None:
+            current = updated.config_2d
+            if current is None:
+                raise KeyError("2D config record not found")
+            updated = updated.with_config_2d(
+                PcbLibViewConfiguration(
+                    config_type=current.config_type,
+                    full_filename=str(config_2d_full_filename),
+                    configuration=current.configuration,
+                )
+            )
+        if config_3d_full_filename is not None:
+            current = updated.config_3d
+            if current is None:
+                raise KeyError("3D config record not found")
+            updated = updated.with_config_3d(
+                PcbLibViewConfiguration(
+                    config_type=current.config_type,
+                    full_filename=str(config_3d_full_filename),
+                    configuration=current.configuration,
+                )
+            )
+        if current_view_state is not None:
+            updated = updated.with_view_state(
+                PcbLibViewState(current_view_state.strip().upper())
+            )
+        return updated
+
+    def with_synthesized_view_configuration(
+        self,
+        output_path: Path,
+        *,
+        current_view_state: str = "2D",
+        config_2d_full_filename: str | Path | None = None,
+        config_3d_full_filename: str | Path | None = None,
+    ) -> "PcbLibLibraryData":
+        resolved_output = Path(output_path).resolve()
+        two_d_path = (
+            str(config_2d_full_filename)
+            if config_2d_full_filename is not None
+            else str(resolved_output.with_suffix(".config_2dsimple"))
+        )
+        three_d_path = (
+            str(config_3d_full_filename)
+            if config_3d_full_filename is not None
+            else "(Not Saved)"
+        )
+        return self.with_view_config_paths(
+            config_2d_full_filename=two_d_path,
+            config_3d_full_filename=three_d_path,
+            current_view_state=current_view_state,
+        )
+
+    @property
+    def current_view_state(self) -> str | None:
+        record = self.get_board_record("CURRENT2D3DVIEWSTATE")
+        return None if record is None else record.get_value("CURRENT2D3DVIEWSTATE")
+
+    @property
+    def viewport_bounds(self) -> dict[str, str] | None:
+        viewport = self.viewport
+        if viewport is None:
+            return None
+        return {
+            "VP.LX": viewport.low_x,
+            "VP.HX": viewport.high_x,
+            "VP.LY": viewport.low_y,
+            "VP.HY": viewport.high_y,
+        }
+
+    @property
+    def viewport(self) -> PcbLibViewport | None:
+        record = self.get_board_record("VP.LX")
+        if record is None:
+            return None
+        return PcbLibViewport(
+            low_x=record.get_value("VP.LX", "") or "",
+            high_x=record.get_value("VP.HX", "") or "",
+            low_y=record.get_value("VP.LY", "") or "",
+            high_y=record.get_value("VP.HY", "") or "",
+        )
+
+    def with_viewport(self, viewport: PcbLibViewport) -> "PcbLibLibraryData":
+        updated = self
+        updated = updated.with_board_record_value("VP.LX", viewport.low_x)
+        updated = updated.with_board_record_value("VP.HX", viewport.high_x)
+        updated = updated.with_board_record_value("VP.LY", viewport.low_y)
+        updated = updated.with_board_record_value("VP.HY", viewport.high_y)
+        return updated
+
+    @property
+    def grid_settings(self) -> PcbLibGridSettings | None:
+        record = self.get_board_record("BIGVISIBLEGRIDSIZE")
+        if record is None:
+            return None
+        return PcbLibGridSettings(
+            big_visible_grid_size=_parse_float_text(
+                record.get_value("BIGVISIBLEGRIDSIZE")
+            )
+            or 0.0,
+            visible_grid_size=_parse_float_text(record.get_value("VISIBLEGRIDSIZE"))
+            or 0.0,
+            snap_grid_size=_parse_float_text(record.get_value("SNAPGRIDSIZE")) or 0.0,
+            snap_grid_size_x=_parse_float_text(record.get_value("SNAPGRIDSIZEX"))
+            or 0.0,
+            snap_grid_size_y=_parse_float_text(record.get_value("SNAPGRIDSIZEY"))
+            or 0.0,
+            electrical_grid_range=record.get_value("ELECTRICALGRIDRANGE", "") or "",
+            electrical_grid_enabled=_parse_bool_text(
+                record.get_value("ELECTRICALGRIDENABLED")
+            )
+            or False,
+            dot_grid=_parse_bool_text(record.get_value("DOTGRID")) or False,
+            dot_grid_large=_parse_bool_text(record.get_value("DOTGRIDLARGE")) or False,
+            display_unit=_parse_int_text(record.get_value("DISPLAYUNIT")) or 0,
+        )
+
+    def with_grid_settings(
+        self,
+        settings: PcbLibGridSettings,
+    ) -> "PcbLibLibraryData":
+        updated = self
+        updated = updated.with_board_record_value(
+            "BIGVISIBLEGRIDSIZE",
+            _format_fixed_float(settings.big_visible_grid_size, places=3),
+        )
+        updated = updated.with_board_record_value(
+            "VISIBLEGRIDSIZE",
+            _format_fixed_float(settings.visible_grid_size, places=3),
+        )
+        updated = updated.with_board_record_value(
+            "SNAPGRIDSIZE",
+            _format_fixed_float(settings.snap_grid_size),
+        )
+        updated = updated.with_board_record_value(
+            "SNAPGRIDSIZEX",
+            _format_fixed_float(settings.snap_grid_size_x),
+        )
+        updated = updated.with_board_record_value(
+            "SNAPGRIDSIZEY",
+            _format_fixed_float(settings.snap_grid_size_y),
+        )
+        updated = updated.with_board_record_value(
+            "ELECTRICALGRIDRANGE",
+            settings.electrical_grid_range,
+        )
+        updated = updated.with_board_record_value(
+            "ELECTRICALGRIDENABLED",
+            _format_bool_text(settings.electrical_grid_enabled),
+        )
+        updated = updated.with_board_record_value(
+            "DOTGRID", _format_bool_text(settings.dot_grid)
+        )
+        updated = updated.with_board_record_value(
+            "DOTGRIDLARGE",
+            _format_bool_text(settings.dot_grid_large),
+        )
+        updated = updated.with_board_record_value(
+            "DISPLAYUNIT", str(settings.display_unit)
+        )
+        return updated
+
+    @property
+    def camera_settings(self) -> PcbLibCameraSettings | None:
+        record = self.get_board_record("LOOKAT.X")
+        if record is None:
+            return None
+        return PcbLibCameraSettings(
+            look_at_x=_parse_float_text(record.get_value("LOOKAT.X")) or 0.0,
+            look_at_y=_parse_float_text(record.get_value("LOOKAT.Y")) or 0.0,
+            look_at_z=_parse_float_text(record.get_value("LOOKAT.Z")) or 0.0,
+            eye_rotation_x=_parse_float_text(record.get_value("EYEROTATION.X")) or 0.0,
+            eye_rotation_y=_parse_float_text(record.get_value("EYEROTATION.Y")) or 0.0,
+            eye_rotation_z=_parse_float_text(record.get_value("EYEROTATION.Z")) or 0.0,
+            zoom_multiplier=_parse_float_text(record.get_value("ZOOMMULT")) or 0.0,
+            view_size_x=_parse_int_text(record.get_value("VIEWSIZE.X")) or 0,
+            view_size_y=_parse_int_text(record.get_value("VIEWSIZE.Y")) or 0,
+            electrical_grid_range=record.get_value("EGRANGE", "") or "",
+            electrical_grid_multiplier=_parse_float_text(record.get_value("EGMULT"))
+            or 0.0,
+            electrical_grid_enabled=_parse_bool_text(record.get_value("EGENABLED"))
+            or False,
+            electrical_grid_snap_to_board_outline=_parse_bool_text(
+                record.get_value("EGSNAPTOBOARDOUTLINE")
+            )
+            or False,
+            electrical_grid_snap_to_arc_centers=_parse_bool_text(
+                record.get_value("EGSNAPTOARCCENTERS")
+            )
+            or False,
+            electrical_grid_use_all_layers=_parse_bool_text(
+                record.get_value("EGUSEALLLAYERS")
+            )
+            or False,
+            object_guide_snap_enabled=_parse_bool_text(
+                record.get_value("OGSNAPENABLED")
+            )
+            or False,
+            midpoint_guide_snap_enabled=_parse_bool_text(
+                record.get_value("MGSNAPENABLED")
+            )
+            or False,
+            point_guide_enabled=_parse_bool_text(record.get_value("POINTGUIDEENABLED"))
+            or False,
+            grid_snap_enabled=_parse_bool_text(record.get_value("GRIDSNAPENABLED"))
+            or False,
+            near_objects_enabled=_parse_bool_text(
+                record.get_value("NEAROBJECTSENABLED")
+            )
+            or False,
+            far_objects_enabled=_parse_bool_text(record.get_value("FAROBJECTSENABLED"))
+            or False,
+        )
+
+    def with_camera_settings(
+        self,
+        settings: PcbLibCameraSettings,
+    ) -> "PcbLibLibraryData":
+        updated = self
+        float_updates = {
+            "LOOKAT.X": settings.look_at_x,
+            "LOOKAT.Y": settings.look_at_y,
+            "LOOKAT.Z": settings.look_at_z,
+            "EYEROTATION.X": settings.eye_rotation_x,
+            "EYEROTATION.Y": settings.eye_rotation_y,
+            "EYEROTATION.Z": settings.eye_rotation_z,
+            "ZOOMMULT": settings.zoom_multiplier,
+            "EGMULT": settings.electrical_grid_multiplier,
+        }
+        for key, value in float_updates.items():
+            updated = updated.with_board_record_value(key, _format_fixed_float(value))
+        int_updates = {
+            "VIEWSIZE.X": settings.view_size_x,
+            "VIEWSIZE.Y": settings.view_size_y,
+        }
+        for key, value in int_updates.items():
+            updated = updated.with_board_record_value(key, str(value))
+        updated = updated.with_board_record_value(
+            "EGRANGE", settings.electrical_grid_range
+        )
+        bool_updates = {
+            "EGENABLED": settings.electrical_grid_enabled,
+            "EGSNAPTOBOARDOUTLINE": settings.electrical_grid_snap_to_board_outline,
+            "EGSNAPTOARCCENTERS": settings.electrical_grid_snap_to_arc_centers,
+            "EGUSEALLLAYERS": settings.electrical_grid_use_all_layers,
+            "OGSNAPENABLED": settings.object_guide_snap_enabled,
+            "MGSNAPENABLED": settings.midpoint_guide_snap_enabled,
+            "POINTGUIDEENABLED": settings.point_guide_enabled,
+            "GRIDSNAPENABLED": settings.grid_snap_enabled,
+            "NEAROBJECTSENABLED": settings.near_objects_enabled,
+            "FAROBJECTSENABLED": settings.far_objects_enabled,
+        }
+        for key, value in bool_updates.items():
+            updated = updated.with_board_record_value(key, _format_bool_text(value))
+        return updated
+
+    def _get_view_configuration(
+        self,
+        prefix: str,
+    ) -> PcbLibViewConfiguration | None:
+        config_type_record = self.get_board_record(f"{prefix}CONFIGTYPE")
+        full_filename_record = self.get_board_record(f"{prefix}CONFIGFULLFILENAME")
+        nested_config = self.get_nested_config(f"{prefix}CONFIGURATION")
+        if (
+            config_type_record is None
+            and full_filename_record is None
+            and nested_config is None
+        ):
+            return None
+        return PcbLibViewConfiguration(
+            config_type=(
+                None
+                if config_type_record is None
+                else _strip_record_terminator(
+                    config_type_record.get_value(f"{prefix}CONFIGTYPE")
+                )
+            ),
+            full_filename=(
+                None
+                if full_filename_record is None
+                else _strip_record_terminator(
+                    full_filename_record.get_value(f"{prefix}CONFIGFULLFILENAME")
+                )
+            ),
+            configuration=(
+                None
+                if nested_config is None
+                else PcbLibConfigurationBlock.from_nested_config(nested_config)
+            ),
+        )
+
+    def _with_view_configuration(
+        self,
+        prefix: str,
+        config: PcbLibViewConfiguration,
+    ) -> "PcbLibLibraryData":
+        updated = self
+        if config.config_type is not None:
+            updated = updated.with_board_record_value(
+                f"{prefix}CONFIGTYPE",
+                config.config_type,
+            )
+        if config.full_filename is not None:
+            updated = updated.with_board_record_value(
+                f"{prefix}CONFIGFULLFILENAME",
+                config.full_filename,
+            )
+        if config.configuration is not None:
+            record = updated.get_board_record(f"{prefix}CONFIGURATION")
+            if record is None:
+                raise KeyError(f"{prefix} config record not found")
+            updated = updated._replace_record(
+                record.with_updated_value(
+                    f"{prefix}CONFIGURATION",
+                    config.configuration.to_nested_config().serialize(),
+                )
+            )
+        return updated
+
+    @property
+    def config_2d(self) -> PcbLibViewConfiguration | None:
+        return self._get_view_configuration("2D")
+
+    def with_config_2d(
+        self,
+        config: PcbLibViewConfiguration,
+    ) -> "PcbLibLibraryData":
+        return self._with_view_configuration("2D", config)
+
+    @property
+    def config_3d(self) -> PcbLibViewConfiguration | None:
+        return self._get_view_configuration("3D")
+
+    def with_config_3d(
+        self,
+        config: PcbLibViewConfiguration,
+    ) -> "PcbLibLibraryData":
+        return self._with_view_configuration("3D", config)
+
+    def _get_2d_view_settings(self) -> PcbLib2DViewSettings | None:
+        configuration = self.config_2d
+        if configuration is None or configuration.configuration is None:
+            return None
+        nested = configuration.configuration.nested_config
+        return PcbLib2DViewSettings(
+            current_layer=nested.get_value("CFG2D.CURRENTLAYER"),
+            display_special_strings=_parse_bool_text(
+                nested.get_value("CFG2D.DISPLAYSPECIALSTRINGS")
+            ),
+            show_test_points=_parse_bool_text(nested.get_value("CFG2D.SHOWTESTPOINTS")),
+            show_origin_marker=_parse_bool_text(
+                nested.get_value("CFG2D.SHOWORIGINMARKER")
+            ),
+            eye_distance=_parse_int_text(nested.get_value("CFG2D.EYEDIST")),
+            show_status_info=_parse_bool_text(nested.get_value("CFG2D.SHOWSTATUSINFO")),
+            show_pad_nets=_parse_bool_text(nested.get_value("CFG2D.SHOWPADNETS")),
+            show_pad_numbers=_parse_bool_text(nested.get_value("CFG2D.SHOWPADNUMBERS")),
+            show_via_nets=_parse_bool_text(nested.get_value("CFG2D.SHOWVIANETS")),
+            show_via_span=_parse_bool_text(nested.get_value("CFG2D.SHOWVIASPAN")),
+            use_transparent_layers=_parse_bool_text(
+                nested.get_value("CFG2D.USETRANSPARENTLAYERS")
+            ),
+            plane_draw_mode=_parse_int_text(nested.get_value("CFG2D.PLANEDRAWMODE")),
+            single_layer_mode_state=_parse_int_text(
+                nested.get_value("CFG2D.SINGLELAYERMODESTATE")
+            ),
+        )
+
+    @property
+    def config_2d_settings(self) -> PcbLib2DViewSettings | None:
+        return self._get_2d_view_settings()
+
+    def with_config_2d_settings(
+        self,
+        settings: PcbLib2DViewSettings,
+    ) -> "PcbLibLibraryData":
+        configuration = self.config_2d
+        if configuration is None or configuration.configuration is None:
+            raise KeyError("2D config record not found")
+        nested = configuration.configuration.nested_config
+        updates: list[tuple[str, str]] = []
+        if settings.current_layer is not None:
+            updates.append(("CFG2D.CURRENTLAYER", settings.current_layer))
+        if settings.display_special_strings is not None:
+            updates.append(
+                (
+                    "CFG2D.DISPLAYSPECIALSTRINGS",
+                    _format_bool_text(settings.display_special_strings),
+                )
+            )
+        if settings.show_test_points is not None:
+            updates.append(
+                ("CFG2D.SHOWTESTPOINTS", _format_bool_text(settings.show_test_points))
+            )
+        if settings.show_origin_marker is not None:
+            updates.append(
+                (
+                    "CFG2D.SHOWORIGINMARKER",
+                    _format_bool_text(settings.show_origin_marker),
+                )
+            )
+        if settings.eye_distance is not None:
+            updates.append(("CFG2D.EYEDIST", str(settings.eye_distance)))
+        if settings.show_status_info is not None:
+            updates.append(
+                ("CFG2D.SHOWSTATUSINFO", _format_bool_text(settings.show_status_info))
+            )
+        if settings.show_pad_nets is not None:
+            updates.append(
+                ("CFG2D.SHOWPADNETS", _format_bool_text(settings.show_pad_nets))
+            )
+        if settings.show_pad_numbers is not None:
+            updates.append(
+                ("CFG2D.SHOWPADNUMBERS", _format_bool_text(settings.show_pad_numbers))
+            )
+        if settings.show_via_nets is not None:
+            updates.append(
+                ("CFG2D.SHOWVIANETS", _format_bool_text(settings.show_via_nets))
+            )
+        if settings.show_via_span is not None:
+            updates.append(
+                ("CFG2D.SHOWVIASPAN", _format_bool_text(settings.show_via_span))
+            )
+        if settings.use_transparent_layers is not None:
+            updates.append(
+                (
+                    "CFG2D.USETRANSPARENTLAYERS",
+                    _format_bool_text(settings.use_transparent_layers),
+                )
+            )
+        if settings.plane_draw_mode is not None:
+            updates.append(("CFG2D.PLANEDRAWMODE", str(settings.plane_draw_mode)))
+        if settings.single_layer_mode_state is not None:
+            updates.append(
+                ("CFG2D.SINGLELAYERMODESTATE", str(settings.single_layer_mode_state))
+            )
+        for key, value in updates:
+            nested = nested.with_updated_value(key, value)
+        return self.with_config_2d(
+            PcbLibViewConfiguration(
+                config_type=configuration.config_type,
+                full_filename=configuration.full_filename,
+                configuration=PcbLibConfigurationBlock.from_nested_config(nested),
+            )
+        )
+
+    def _get_3d_view_settings(self) -> PcbLib3DViewSettings | None:
+        configuration = self.config_3d
+        if configuration is None or configuration.configuration is None:
+            return None
+        nested = configuration.configuration.nested_config
+        return PcbLib3DViewSettings(
+            show_component_bodies=_parse_bool_text(
+                nested.get_value("CFG3D.SHOWCOMPONENTBODIES")
+            ),
+            show_component_step_models=_parse_bool_text(
+                nested.get_value("CFG3D.SHOWCOMPONENTSTEPMODELS")
+            ),
+            component_model_preference=_parse_int_text(
+                nested.get_value("CFG3D.COMPONENTMODELPREFERENCE")
+            ),
+            show_component_axes=_parse_bool_text(
+                nested.get_value("CFG3D.SHOWCOMPONENTAXES")
+            ),
+            show_board_core=_parse_bool_text(nested.get_value("CFG3D.SHOWBOARDCORE")),
+            show_board_prepreg=_parse_bool_text(
+                nested.get_value("CFG3D.SHOWBOARDPREPREG")
+            ),
+            show_top_silkscreen=_parse_bool_text(
+                nested.get_value("CFG3D.SHOWTOPSILKSCREEN")
+            ),
+            show_bottom_silkscreen=_parse_bool_text(
+                nested.get_value("CFG3D.SHOWBOTSILKSCREEN")
+            ),
+            show_origin_marker=_parse_bool_text(
+                nested.get_value("CFG3D.SHOWORIGINMARKER")
+            ),
+            eye_distance=_parse_int_text(nested.get_value("CFG3D.EYEDIST")),
+            show_cutouts=_parse_bool_text(nested.get_value("CFG3D.SHOWCUTOUTS")),
+            show_route_tool_path=_parse_bool_text(
+                nested.get_value("CFG3D.SHOWROUTETOOLPATH")
+            ),
+            show_rooms_3d=_parse_bool_text(nested.get_value("CFG3D.SHOWROOMS3D")),
+            use_system_colors=_parse_bool_text(
+                nested.get_value("CFG3D.USESYSCOLORSFOR3D")
+            ),
+        )
+
+    @property
+    def config_3d_settings(self) -> PcbLib3DViewSettings | None:
+        return self._get_3d_view_settings()
+
+    def with_config_3d_settings(
+        self,
+        settings: PcbLib3DViewSettings,
+    ) -> "PcbLibLibraryData":
+        configuration = self.config_3d
+        if configuration is None or configuration.configuration is None:
+            raise KeyError("3D config record not found")
+        nested = configuration.configuration.nested_config
+        updates: list[tuple[str, str]] = []
+        if settings.show_component_bodies is not None:
+            updates.append(
+                (
+                    "CFG3D.SHOWCOMPONENTBODIES",
+                    _format_bool_text(settings.show_component_bodies),
+                )
+            )
+        if settings.show_component_step_models is not None:
+            updates.append(
+                (
+                    "CFG3D.SHOWCOMPONENTSTEPMODELS",
+                    _format_bool_text(settings.show_component_step_models),
+                )
+            )
+        if settings.component_model_preference is not None:
+            updates.append(
+                (
+                    "CFG3D.COMPONENTMODELPREFERENCE",
+                    str(settings.component_model_preference),
+                )
+            )
+        if settings.show_component_axes is not None:
+            updates.append(
+                (
+                    "CFG3D.SHOWCOMPONENTAXES",
+                    _format_bool_text(settings.show_component_axes),
+                )
+            )
+        if settings.show_board_core is not None:
+            updates.append(
+                ("CFG3D.SHOWBOARDCORE", _format_bool_text(settings.show_board_core))
+            )
+        if settings.show_board_prepreg is not None:
+            updates.append(
+                (
+                    "CFG3D.SHOWBOARDPREPREG",
+                    _format_bool_text(settings.show_board_prepreg),
+                )
+            )
+        if settings.show_top_silkscreen is not None:
+            updates.append(
+                (
+                    "CFG3D.SHOWTOPSILKSCREEN",
+                    _format_bool_text(settings.show_top_silkscreen),
+                )
+            )
+        if settings.show_bottom_silkscreen is not None:
+            updates.append(
+                (
+                    "CFG3D.SHOWBOTSILKSCREEN",
+                    _format_bool_text(settings.show_bottom_silkscreen),
+                )
+            )
+        if settings.show_origin_marker is not None:
+            updates.append(
+                (
+                    "CFG3D.SHOWORIGINMARKER",
+                    _format_bool_text(settings.show_origin_marker),
+                )
+            )
+        if settings.eye_distance is not None:
+            updates.append(("CFG3D.EYEDIST", str(settings.eye_distance)))
+        if settings.show_cutouts is not None:
+            updates.append(
+                ("CFG3D.SHOWCUTOUTS", _format_bool_text(settings.show_cutouts))
+            )
+        if settings.show_route_tool_path is not None:
+            updates.append(
+                (
+                    "CFG3D.SHOWROUTETOOLPATH",
+                    _format_bool_text(settings.show_route_tool_path),
+                )
+            )
+        if settings.show_rooms_3d is not None:
+            updates.append(
+                ("CFG3D.SHOWROOMS3D", _format_bool_text(settings.show_rooms_3d))
+            )
+        if settings.use_system_colors is not None:
+            updates.append(
+                (
+                    "CFG3D.USESYSCOLORSFOR3D",
+                    _format_bool_text(settings.use_system_colors),
+                )
+            )
+        for key, value in updates:
+            nested = nested.with_updated_value(key, value)
+        return self.with_config_3d(
+            PcbLibViewConfiguration(
+                config_type=configuration.config_type,
+                full_filename=configuration.full_filename,
+                configuration=PcbLibConfigurationBlock.from_nested_config(nested),
+            )
+        )
+
+    @property
+    def layer_opacity_table(self) -> PcbLibLayerOpacityTable | None:
+        configuration = self.config_2d
+        if configuration is None or configuration.configuration is None:
+            return None
+        nested = configuration.configuration.nested_config
+        entries: list[PcbLibLayerOpacityEntry] = []
+        for segment in nested.segments:
+            key = segment.key
+            if key is None or segment.value is None:
+                continue
+            match = _LAYER_OPACITY_KEY_RE.match(key)
+            if match is None:
+                continue
+            values = _parse_float_series_text(segment.value)
+            if values is None:
+                continue
+            entries.append(
+                PcbLibLayerOpacityEntry(
+                    layer_name=match.group(1),
+                    values=values,
+                )
+            )
+        return PcbLibLayerOpacityTable(entries=tuple(entries))
+
+    def with_layer_opacity_table(
+        self,
+        table: PcbLibLayerOpacityTable,
+    ) -> "PcbLibLibraryData":
+        configuration = self.config_2d
+        if configuration is None or configuration.configuration is None:
+            raise KeyError("2D config record not found")
+        nested = configuration.configuration.nested_config
+        for entry in table.entries:
+            nested = nested.with_updated_value(
+                f"CFG2D.LAYEROPACITY.{entry.layer_name}",
+                _format_float_series_text(entry.values),
+            )
+        return self.with_config_2d(
+            PcbLibViewConfiguration(
+                config_type=configuration.config_type,
+                full_filename=configuration.full_filename,
+                configuration=PcbLibConfigurationBlock.from_nested_config(nested),
+            )
+        )
+
+    @property
+    def toggle_layer_settings(self) -> PcbLibToggleLayerSettings | None:
+        configuration = self.config_2d
+        if configuration is None or configuration.configuration is None:
+            return None
+        nested = configuration.configuration.nested_config
+        toggle_layers = _parse_bool_mask_text(nested.get_value("CFG2D.TOGGLELAYERS"))
+        mechanical_layers_in_single_layer_mode = _parse_bool_mask_text(
+            nested.get_value("CFG2D.MECHLAYERINSINGLELAYERMODE")
+        )
+        mechanical_layers_linked_to_sheet = _parse_bool_mask_text(
+            nested.get_value("CFG2D.MECHLAYERLINKEDTOSHEET")
+        )
+        if (
+            toggle_layers is None
+            or mechanical_layers_in_single_layer_mode is None
+            or mechanical_layers_linked_to_sheet is None
+        ):
+            return None
+        return PcbLibToggleLayerSettings(
+            toggle_layers=toggle_layers,
+            toggle_layers_set=nested.get_value("CFG2D.TOGGLELAYERS.SET"),
+            all_connections_in_single_layer_mode=_parse_bool_text(
+                nested.get_value("CFG2D.ALLCONNECTIONSINSINGLELAYERMODE")
+            ),
+            mechanical_layers_in_single_layer_mode=mechanical_layers_in_single_layer_mode,
+            mechanical_layers_in_single_layer_mode_set=nested.get_value(
+                "CFG2D.MECHLAYERINSINGLELAYERMODE.SET"
+            ),
+            mechanical_layers_linked_to_sheet=mechanical_layers_linked_to_sheet,
+            mechanical_layers_linked_to_sheet_set=nested.get_value(
+                "CFG2D.MECHLAYERLINKEDTOSHEET.SET"
+            ),
+            mechanical_cover_layer_updated=_parse_bool_text(
+                nested.get_value("CFG2D.MECHCOVERLAYERUPDATED")
+            ),
+        )
+
+    def with_toggle_layer_settings(
+        self,
+        settings: PcbLibToggleLayerSettings,
+    ) -> "PcbLibLibraryData":
+        configuration = self.config_2d
+        if configuration is None or configuration.configuration is None:
+            raise KeyError("2D config record not found")
+        nested = configuration.configuration.nested_config
+        nested = nested.with_updated_value(
+            "CFG2D.TOGGLELAYERS",
+            _format_bool_mask_text(settings.toggle_layers),
+        )
+        if settings.toggle_layers_set is not None:
+            nested = nested.with_updated_value(
+                "CFG2D.TOGGLELAYERS.SET",
+                settings.toggle_layers_set,
+            )
+        if settings.all_connections_in_single_layer_mode is not None:
+            nested = nested.with_updated_value(
+                "CFG2D.ALLCONNECTIONSINSINGLELAYERMODE",
+                _format_bool_text(settings.all_connections_in_single_layer_mode),
+            )
+        nested = nested.with_updated_value(
+            "CFG2D.MECHLAYERINSINGLELAYERMODE",
+            _format_bool_mask_text(settings.mechanical_layers_in_single_layer_mode),
+        )
+        if settings.mechanical_layers_in_single_layer_mode_set is not None:
+            nested = nested.with_updated_value(
+                "CFG2D.MECHLAYERINSINGLELAYERMODE.SET",
+                settings.mechanical_layers_in_single_layer_mode_set,
+            )
+        nested = nested.with_updated_value(
+            "CFG2D.MECHLAYERLINKEDTOSHEET",
+            _format_bool_mask_text(settings.mechanical_layers_linked_to_sheet),
+        )
+        if settings.mechanical_layers_linked_to_sheet_set is not None:
+            nested = nested.with_updated_value(
+                "CFG2D.MECHLAYERLINKEDTOSHEET.SET",
+                settings.mechanical_layers_linked_to_sheet_set,
+            )
+        if settings.mechanical_cover_layer_updated is not None:
+            nested = nested.with_updated_value(
+                "CFG2D.MECHCOVERLAYERUPDATED",
+                _format_bool_text(settings.mechanical_cover_layer_updated),
+            )
+        return self.with_config_2d(
+            PcbLibViewConfiguration(
+                config_type=configuration.config_type,
+                full_filename=configuration.full_filename,
+                configuration=PcbLibConfigurationBlock.from_nested_config(nested),
+            )
+        )
+
+    @property
+    def layer_sets(self) -> PcbLibLayerSets:
+        record = self.get_board_record("LAYERSETSCOUNT")
+        if record is None:
+            return PcbLibLayerSets(sets=())
+        count = _parse_int_text(record.get_value("LAYERSETSCOUNT")) or 0
+        sets: list[PcbLibLayerSet] = []
+        for index in range(1, count + 1):
+            prefix = f"LAYERSET{index}"
+            layers_value = record.get_value(f"{prefix}LAYERS") or ""
+            sets.append(
+                PcbLibLayerSet(
+                    index=index,
+                    name=record.get_value(f"{prefix}NAME") or "",
+                    layers=tuple(
+                        part for part in layers_value.split(",") if part != ""
+                    ),
+                    active_layer=record.get_value(f"{prefix}ACTIVELAYER.7") or "",
+                    is_current=_parse_bool_text(record.get_value(f"{prefix}ISCURRENT"))
+                    or False,
+                    is_locked=_parse_bool_text(record.get_value(f"{prefix}ISLOCKED"))
+                    or False,
+                    flip_board=_parse_bool_text(record.get_value(f"{prefix}FLIPBOARD"))
+                    or False,
+                )
+            )
+        return PcbLibLayerSets(sets=tuple(sets))
+
+    def with_layer_sets(
+        self,
+        layer_sets: PcbLibLayerSets,
+    ) -> "PcbLibLibraryData":
+        record = self.get_board_record("LAYERSETSCOUNT")
+        if record is None:
+            raise KeyError("Layer sets record not found")
+        updated = self.with_board_record_value(
+            "LAYERSETSCOUNT", str(len(layer_sets.sets))
+        )
+        for layer_set in layer_sets.sets:
+            prefix = f"LAYERSET{layer_set.index}"
+            updated = updated.with_board_record_value(f"{prefix}NAME", layer_set.name)
+            updated = updated.with_board_record_value(
+                f"{prefix}LAYERS",
+                ",".join(layer_set.layers),
+            )
+            updated = updated.with_board_record_value(
+                f"{prefix}ACTIVELAYER.7",
+                layer_set.active_layer,
+            )
+            updated = updated.with_board_record_value(
+                f"{prefix}ISCURRENT",
+                _format_bool_text(layer_set.is_current),
+            )
+            updated = updated.with_board_record_value(
+                f"{prefix}ISLOCKED",
+                _format_bool_text(layer_set.is_locked),
+            )
+            updated = updated.with_board_record_value(
+                f"{prefix}FLIPBOARD",
+                _format_bool_text(layer_set.flip_board),
+            )
+        return updated
+
+    def _enabled_mechanical_layer_numbers(self) -> tuple[int, ...]:
+        layer_table = self.layer_table
+        enabled_numbers: set[int] = set()
+        for entry in layer_table.legacy_layers:
+            if not entry.mechanical_enabled:
+                continue
+            number = entry.layer_number - PcbLayer.MECHANICAL_1.value + 1
+            if 1 <= number <= 16:
+                enabled_numbers.add(number)
+        for entry in layer_table.v7_layers:
+            if not entry.mechanical_enabled:
+                continue
+            first_v7_id = pcb_mechanical_layer_number_to_v7_saved_layer_id(1)
+            if first_v7_id is None:
+                continue
+            number = entry.layer_id - first_v7_id + 1
+            if 17 <= number <= PCB_USER_MECHANICAL_LAYER_AUTHORING_MAX:
+                enabled_numbers.add(number)
+        return tuple(sorted(enabled_numbers))
+
+    def _with_enabled_mechanical_layers_in_layer_sets(self) -> "PcbLibLibraryData":
+        layer_sets = self.layer_sets
+        enabled_numbers = self._enabled_mechanical_layer_numbers()
+        enabled_legacy_tokens = tuple(
+            mechanical_layer_set_token(number)
+            for number in enabled_numbers
+            if number <= 16
+        )
+        enabled_extended_tokens = tuple(
+            mechanical_layer_set_token(number)
+            for number in enabled_numbers
+            if number > 16
+        )
+        enabled_tokens = enabled_legacy_tokens + enabled_extended_tokens
+
+        updated_sets: list[PcbLibLayerSet] = []
+        for layer_set in layer_sets.sets:
+            if layer_set.index == 1:
+                prefix, has_drill_drawing, suffix = split_layer_set_nonmechanical_parts(
+                    layer_set.layers
+                )
+                layers = (
+                    prefix
+                    + enabled_legacy_tokens
+                    + (("DrillDrawing",) if has_drill_drawing else ())
+                    + enabled_extended_tokens
+                    + suffix
+                )
+                updated_sets.append(replace(layer_set, layers=layers))
+            elif layer_set.index == 5:
+                updated_sets.append(replace(layer_set, layers=enabled_tokens))
+            else:
+                updated_sets.append(layer_set)
+        return self.with_layer_sets(PcbLibLayerSets(sets=tuple(updated_sets)))
+
+    @staticmethod
+    def _is_layer_table_record(record: PcbLibLibraryDataRecord) -> bool:
+        return any(
+            (
+                seg.key is not None
+                and (
+                    _LEGACY_LAYER_KEY_RE.match(seg.key) is not None
+                    or _V7_LAYER_KEY_RE.match(seg.key) is not None
+                )
+            )
+            for seg in record.property_segments
+        )
+
+    @property
+    def layer_table(self) -> PcbLibLayerTable:
+        legacy_rows: dict[int, dict[str, str]] = {}
+        v7_rows: dict[int, dict[str, str]] = {}
+        for record in self.record_blocks:
+            if not self._is_layer_table_record(record):
+                continue
+            for segment in record.property_segments:
+                key = segment.key
+                if key is None or segment.value is None:
+                    continue
+                legacy_match = _LEGACY_LAYER_KEY_RE.match(key)
+                if legacy_match is not None:
+                    layer_number = int(legacy_match.group(1))
+                    field_name = legacy_match.group(2)
+                    legacy_rows.setdefault(layer_number, {})[field_name] = segment.value
+                    continue
+                v7_match = _V7_LAYER_KEY_RE.match(key)
+                if v7_match is not None:
+                    index = int(v7_match.group(1))
+                    field_name = v7_match.group(2)
+                    v7_rows.setdefault(index, {})[field_name] = segment.value
+
+        legacy_layers = tuple(
+            PcbLibLegacyLayerEntry(
+                layer_number=layer_number,
+                name=values["NAME"],
+                previous_layer=int(values["PREV"]),
+                next_layer=int(values["NEXT"]),
+                mechanical_enabled=_parse_bool_text(values["MECHENABLED"]) or False,
+                copper_thickness=values["COPTHICK"],
+                dielectric_type=int(values["DIELTYPE"]),
+                dielectric_constant=values["DIELCONST"],
+                dielectric_height=values["DIELHEIGHT"],
+                dielectric_material=values["DIELMATERIAL"],
+            )
+            for layer_number, values in sorted(legacy_rows.items())
+        )
+        v7_layers = tuple(
+            PcbLibV7LayerEntry(
+                index=index,
+                layer_id=int(values["LAYERID"]),
+                name=values["NAME"],
+                previous_layer=int(values["PREV"]),
+                next_layer=int(values["NEXT"]),
+                mechanical_enabled=_parse_bool_text(values["MECHENABLED"]) or False,
+                copper_thickness=values["COPTHICK"],
+                dielectric_type=int(values["DIELTYPE"]),
+                dielectric_constant=values["DIELCONST"],
+                dielectric_height=values["DIELHEIGHT"],
+                dielectric_material=values["DIELMATERIAL"],
+            )
+            for index, values in sorted(v7_rows.items())
+        )
+        return PcbLibLayerTable(legacy_layers=legacy_layers, v7_layers=v7_layers)
+
+    def with_layer_table(
+        self,
+        layer_table: PcbLibLayerTable,
+    ) -> "PcbLibLibraryData":
+        update_map: dict[str, str] = {}
+        for entry in layer_table.legacy_layers:
+            prefix = f"LAYER{entry.layer_number}"
+            update_map[f"{prefix}NAME"] = entry.name
+            update_map[f"{prefix}PREV"] = str(entry.previous_layer)
+            update_map[f"{prefix}NEXT"] = str(entry.next_layer)
+            update_map[f"{prefix}MECHENABLED"] = _format_bool_text(
+                entry.mechanical_enabled
+            )
+            update_map[f"{prefix}COPTHICK"] = entry.copper_thickness
+            update_map[f"{prefix}DIELTYPE"] = str(entry.dielectric_type)
+            update_map[f"{prefix}DIELCONST"] = entry.dielectric_constant
+            update_map[f"{prefix}DIELHEIGHT"] = entry.dielectric_height
+            update_map[f"{prefix}DIELMATERIAL"] = entry.dielectric_material
+        for entry in layer_table.v7_layers:
+            prefix = f"LAYERV7_{entry.index}"
+            update_map[f"{prefix}LAYERID"] = str(entry.layer_id)
+            update_map[f"{prefix}NAME"] = entry.name
+            update_map[f"{prefix}PREV"] = str(entry.previous_layer)
+            update_map[f"{prefix}NEXT"] = str(entry.next_layer)
+            update_map[f"{prefix}MECHENABLED"] = _format_bool_text(
+                entry.mechanical_enabled
+            )
+            update_map[f"{prefix}COPTHICK"] = entry.copper_thickness
+            update_map[f"{prefix}DIELTYPE"] = str(entry.dielectric_type)
+            update_map[f"{prefix}DIELCONST"] = entry.dielectric_constant
+            update_map[f"{prefix}DIELHEIGHT"] = entry.dielectric_height
+            update_map[f"{prefix}DIELMATERIAL"] = entry.dielectric_material
+
+        seen_keys: set[str] = set()
+        layer_table_ranges: list[tuple[int, int]] = []
+        for record in self.record_blocks:
+            if not self._is_layer_table_record(record):
+                continue
+            layer_table_ranges.append((record.start_index, record.end_index))
+            for segment in record.property_segments:
+                if segment.key is not None:
+                    seen_keys.add(segment.key)
+
+        new_segments = list(self.segments)
+        for record in self.record_blocks:
+            if not self._is_layer_table_record(record):
+                continue
+            for offset, segment in enumerate(record.segments):
+                key = segment.key
+                if key is not None and key in update_map:
+                    new_segments[record.start_index + offset] = (
+                        PcbLibLibraryDataSegment(raw=f"{key}={update_map[key]}")
+                    )
+
+        missing_segments = tuple(
+            PcbLibLibraryDataSegment(raw=f"{key}={value}")
+            for key, value in update_map.items()
+            if key not in seen_keys
+        )
+        if missing_segments:
+            insert_index = (
+                layer_table_ranges[0][1] if layer_table_ranges else len(new_segments)
+            )
+            new_segments[insert_index:insert_index] = missing_segments
+        return PcbLibLibraryData(
+            segments=tuple(new_segments),
+            leading_pipe=self.leading_pipe,
+            trailing_nul=self.trailing_nul,
+        )
+
+    def with_mechanical_layer(
+        self,
+        layer: int | str | PcbLayer,
+        *,
+        name: str | None = None,
+        enabled: bool = True,
+    ) -> "PcbLibLibraryData":
+        mechanical_number = _coerce_mechanical_layer_number(layer)
+        legacy_id = mechanical_layer_number_to_legacy_layer_id(mechanical_number)
+        v7_layer_id = pcb_mechanical_layer_number_to_v7_saved_layer_id(
+            mechanical_number
+        )
+        if v7_layer_id is None:
+            raise ValueError(f"Unsupported mechanical layer: {layer!r}")
+
+        layer_table = self.layer_table
+        existing_name = None
+        if legacy_id is not None:
+            legacy_entry = layer_table.legacy_layer(legacy_id)
+            if legacy_entry is not None and legacy_entry.name.strip():
+                existing_name = legacy_entry.name.strip()
+        if existing_name is None:
+            v7_entry = layer_table.v7_layer_by_layer_id(v7_layer_id)
+            if v7_entry is not None and v7_entry.name.strip():
+                existing_name = v7_entry.name.strip()
+
+        layer_name = (
+            (name or "").strip() or existing_name or f"Mechanical {mechanical_number}"
+        )
+
+        updated_legacy_layers = []
+        legacy_updated = False
+        for entry in layer_table.legacy_layers:
+            if entry.layer_number == legacy_id:
+                updated_legacy_layers.append(
+                    replace(entry, name=layer_name, mechanical_enabled=bool(enabled))
+                )
+                legacy_updated = True
+            else:
+                updated_legacy_layers.append(entry)
+
+        updated_v7_layers = []
+        v7_updated = False
+        for entry in layer_table.v7_layers:
+            if entry.layer_id == v7_layer_id:
+                updated_v7_layers.append(
+                    replace(entry, name=layer_name, mechanical_enabled=bool(enabled))
+                )
+                v7_updated = True
+            else:
+                updated_v7_layers.append(entry)
+
+        if not legacy_updated and not v7_updated:
+            v7_index = (
+                max((entry.index for entry in layer_table.v7_layers), default=-1) + 1
+            )
+            template = _pcblib_v7_mechanical_row_template(
+                layer_table,
+                v7_layer_id,
+            )
+            updated_v7_layers.append(
+                replace(
+                    template,
+                    index=v7_index,
+                    layer_id=v7_layer_id,
+                    name=layer_name,
+                    mechanical_enabled=bool(enabled),
+                )
+            )
+            v7_updated = True
+
+        updated = self.with_layer_table(
+            PcbLibLayerTable(
+                legacy_layers=tuple(updated_legacy_layers),
+                v7_layers=tuple(updated_v7_layers),
+            )
+        )
+        enabled_text = _format_bool_text(enabled)
+        field_values = {
+            "ID": authored_mechanical_layer_row_id(mechanical_number),
+            "NAME": layer_name,
+            "LAYERID": str(int(v7_layer_id)),
+            "USEDBYPRIMS": "FALSE",
+            "MECHENABLED": enabled_text,
+        }
+        updated = updated._with_indexed_layer_row(
+            key_re=_V9_CACHE_LAYER_KEY_RE,
+            group_index=mechanical_layer_v9_cache_index(mechanical_number),
+            layer_id=v7_layer_id,
+            field_values=field_values,
+            key_prefix="V9_CACHE_LAYER",
+            separator="_",
+        )
+        updated = updated._with_indexed_layer_row(
+            key_re=_LAYER_V8_KEY_RE,
+            group_index=mechanical_layer_v8_index(mechanical_number),
+            layer_id=v7_layer_id,
+            field_values=field_values,
+            key_prefix="LAYER_V8_",
+            separator="",
+        )
+        return updated._with_enabled_mechanical_layers_in_layer_sets()
+
+    def _next_mechanical_pair_index(self) -> int:
+        pair_indices: set[int] = set()
+        for segment in self.segments:
+            key = segment.key or ""
+            match = re.fullmatch(r"MECHPAIR(\d+)L[12]", key, re.IGNORECASE)
+            if match:
+                pair_indices.add(int(match.group(1)))
+        candidate = 0
+        while candidate in pair_indices:
+            candidate += 1
+        return candidate
+
+    def _mechanical_pair_insert_key(self, pair_index: int) -> str | None:
+        existing_keys = {
+            segment.key for segment in self.segments if segment.key is not None
+        }
+        for candidate in range(int(pair_index) - 1, -1, -1):
+            key = f"MECHPAIR{candidate}L2"
+            if key in existing_keys:
+                return key
+        if "LAYERSET5FLIPBOARD" in existing_keys:
+            return "LAYERSET5FLIPBOARD"
+        return None
+
+    def with_route_tool_path_layer(
+        self,
+        layer: int | str | PcbLayer,
+    ) -> "PcbLibLibraryData":
+        mechanical_number = _coerce_mechanical_layer_number(layer)
+        return self._with_segment_value(
+            "ROUTETOOLPATHLAYER",
+            f"MECHANICAL{mechanical_number}",
+            preferred_segment_key=self._mechanical_pair_insert_key(10_000),
+        )
+
+    def with_mechanical_layer_pair(
+        self,
+        layer_1: int | str | PcbLayer,
+        layer_2: int | str | PcbLayer,
+        *,
+        pair_index: int | None = None,
+    ) -> "PcbLibLibraryData":
+        layer_1_number = _coerce_mechanical_layer_number(layer_1)
+        layer_2_number = _coerce_mechanical_layer_number(layer_2)
+        if layer_1_number == layer_2_number:
+            raise ValueError("Mechanical layer pair endpoints must differ")
+        resolved_pair_index = (
+            self._next_mechanical_pair_index()
+            if pair_index is None
+            else int(pair_index)
+        )
+        if resolved_pair_index < 0:
+            raise ValueError("Mechanical layer pair index must be non-negative")
+
+        updated = self.with_mechanical_layer(
+            f"MECHANICAL{layer_1_number}", enabled=True
+        )
+        updated = updated.with_mechanical_layer(
+            f"MECHANICAL{layer_2_number}", enabled=True
+        )
+        prefix = f"MECHPAIR{resolved_pair_index}"
+        updated = updated._with_segment_value(
+            f"{prefix}L1",
+            f"MECHANICAL{layer_1_number}",
+            preferred_segment_key=updated._mechanical_pair_insert_key(
+                resolved_pair_index
+            ),
+        )
+        return updated._with_segment_value(
+            f"{prefix}L2",
+            f"MECHANICAL{layer_2_number}",
+            preferred_segment_key=f"{prefix}L1",
+        )
+
+
+@dataclass(frozen=True)
+class PcbLibBuildProfile:
+    library_data: PcbLibLibraryData
+    file_header: PcbLibFileHeader
+    pad_via_library: PcbLibPadViaLibrary
+
+    @property
+    def library_data_header(self) -> bytes:
+        return self.library_data.serialize()
+
+    @property
+    def file_header_magic(self) -> str:
+        return self.file_header.magic
+
+    @property
+    def pad_via_library_guid(self) -> uuid.UUID:
+        return self.pad_via_library.library_id
+
+    @classmethod
+    def from_pcblib(cls, path: Path) -> "PcbLibBuildProfile":
+        ole = AltiumOleFile(str(path))
+        try:
+            library_data = ole.openstream("Library/Data")
+            header_len = struct.unpack("<I", library_data[:4])[0]
+            header_bytes = library_data[4 : 4 + header_len]
+
+            return cls(
+                library_data=PcbLibLibraryData.from_bytes(header_bytes),
+                file_header=(
+                    PcbLibFileHeader.from_bytes(ole.openstream("FileHeader"))
+                    if ole.exists("FileHeader")
+                    else PcbLibFileHeader.random_default()
+                ),
+                pad_via_library=(
+                    PcbLibPadViaLibrary.from_bytes(
+                        ole.openstream("Library/PadViaLibrary/Data")
+                    )
+                    if ole.exists("Library/PadViaLibrary/Data")
+                    else PcbLibPadViaLibrary(library_id=uuid.uuid4())
+                ),
+            )
+        finally:
+            ole.close()
+
+    @classmethod
+    def default(cls) -> "PcbLibBuildProfile":
+        return cls(
+            library_data=PcbLibLibraryData.default(),
+            file_header=PcbLibFileHeader.default(
+                magic=DEFAULT_PCBLIB_FILE_HEADER_MAGIC,
+            ),
+            pad_via_library=PcbLibPadViaLibrary(
+                library_id=DEFAULT_PCBLIB_PAD_VIA_LIBRARY_GUID
+            ),
+        )
+
+
+@dataclass
+class PcbLibFootprintSpec:
+    footprint: AltiumPcbFootprint
+    height: str = "0mil"
+    description: str = ""
+    item_guid: str = ""
+    revision_guid: str = ""
+    component_guid: uuid.UUID = field(default_factory=uuid.uuid4)
+    widestrings: dict[int, str] = field(default_factory=dict)
+    primitive_guids: dict[object, uuid.UUID] = field(default_factory=dict)
+    primitive_unique_ids: dict[object, str] = field(default_factory=dict)
+    preserved_primitive_guids: bytes | None = None
+    preserved_primitive_guids_header: bytes | None = None
+    preserved_uniqueid_info: bytes | None = None
+    preserved_uniqueid_info_header: bytes | None = None
+
+
+@dataclass
+class PcbLibModelSpec:
+    model: AltiumPcbModel
+    embedded_payload: bytes
+
+
+class PcbLibBuilder:
+    """
+    Dedicated builder for constructing PcbLib containers and footprint streams.
+
+    The builder emits file-level OLE streams without going through any
+    `PcbDoc -> PcbLib` path.
+    """
+
+    def __init__(self, profile: PcbLibBuildProfile | None = None) -> None:
+        self.profile = profile or PcbLibBuildProfile.default()
+        self._footprints: list[PcbLibFootprintSpec] = []
+        self._embedded_models: list[PcbLibModelSpec] = []
+        self.layer_kind_mapping_data = PcbLibLayerKindMapping.make_default()
+
+    def _set_library_data(self, library_data: PcbLibLibraryData) -> None:
+        self.profile = PcbLibBuildProfile(
+            library_data=library_data,
+            file_header=self.profile.file_header,
+            pad_via_library=self.profile.pad_via_library,
+        )
+
+    def set_mechanical_layer(
+        self,
+        layer: int | str | PcbLayer,
+        *,
+        name: str | None = None,
+        enabled: bool = True,
+    ) -> "PcbLibBuilder":
+        """
+        Set a mechanical layer display name and enabled state.
+
+        Args:
+            layer: Mechanical layer token or number. Supported tokens include
+                `"MECHANICAL17"` and `"MECHANICAL53"`;
+                `PcbLayer.MECHANICAL_*` enum values cover
+                Mechanical 1 through 16.
+            name: Optional display name. If omitted, the existing layer-table
+                label is preserved, falling back to `Mechanical N`.
+            enabled: Whether the layer is enabled in the PcbLib layer registry.
+        """
+        self._set_library_data(
+            self.profile.library_data.with_mechanical_layer(
+                layer,
+                name=name,
+                enabled=enabled,
+            )
+        )
+        return self
+
+    def _register_extended_mechanical_primitive_layer(
+        self,
+        layer_ref: PcbLayerRef,
+    ) -> None:
+        if (
+            layer_ref.family == PcbLayerFamily.MECHANICAL
+            and layer_ref.number is not None
+            and layer_ref.number > 16
+        ):
+            self.set_mechanical_layer(layer_ref.token)
+
+    def set_mechanical_layer_pair(
+        self,
+        layer_1: int | str | PcbLayer,
+        layer_2: int | str | PcbLayer,
+        *,
+        pair_index: int | None = None,
+    ) -> "PcbLibBuilder":
+        """
+        Define a mechanical mirror pair used by component side flipping.
+
+        Args:
+            layer_1: First mechanical layer endpoint.
+            layer_2: Second mechanical layer endpoint.
+            pair_index: Optional native `MECHPAIR{N}` index. If omitted, the
+                first unused index is selected.
+        """
+        self._set_library_data(
+            self.profile.library_data.with_mechanical_layer_pair(
+                layer_1,
+                layer_2,
+                pair_index=pair_index,
+            )
+        )
+        return self
+
+    def set_route_tool_path_layer(
+        self,
+        layer: int | str | PcbLayer,
+    ) -> "PcbLibBuilder":
+        """Set the PcbLib route-tool-path mechanical layer token."""
+
+        self._set_library_data(
+            self.profile.library_data.with_route_tool_path_layer(layer)
+        )
+        return self
+
+    @property
+    def mechanical_layer_kinds(self) -> dict[int, MechanicalLayerKind]:
+        """Return the current mapping by LayerKindMapping/Data layer id."""
+
+        return dict(self.layer_kind_mapping_data.mapping)
+
+    def get_mechanical_layer_kind(
+        self,
+        layer: int | str | PcbLayer,
+    ) -> MechanicalLayerKind | None:
+        """Return the configured kind for a mechanical layer, if present."""
+
+        from .altium_pcb_layer_kind_mapping import coerce_layer_kind_mapping_layer_id
+
+        return self.layer_kind_mapping_data.mapping.get(
+            coerce_layer_kind_mapping_layer_id(layer)
+        )
+
+    def set_mechanical_layer_kind(
+        self,
+        layer: int | str | PcbLayer,
+        kind: int | str | MechanicalLayerKind,
+    ) -> "PcbLibBuilder":
+        """
+        Set the semantic kind assigned to a mechanical layer.
+
+        PcbLib files persist this both in `Library/LayerKindMapping/Data` and
+        in several `Library/Data` layer registry/cache `MECHKIND` fields.
+        Mechanical33 and higher kind mapping remains gated because
+        `LayerKindMapping/Data` is a separate native ID space from saved V7
+        layer IDs.
+        """
+        kind_value = coerce_mechanical_layer_kind(kind)
+        self.layer_kind_mapping_data = self.layer_kind_mapping_data.with_layer_kind(
+            layer,
+            kind_value,
+        )
+        self._set_library_data(
+            self.profile.library_data.with_mechanical_layer_kind(layer, kind_value)
+        )
+        if kind_value == MechanicalLayerKind.ROUTE_TOOL_PATH:
+            self.set_route_tool_path_layer(layer)
+        return self
+
+    @staticmethod
+    def _format_model_id(value: uuid.UUID | str | None = None) -> str:
+        if value is None:
+            value = uuid.uuid4()
+        if isinstance(value, uuid.UUID):
+            return "{" + str(value).upper() + "}"
+        text = str(value).strip()
+        if text.startswith("{") and text.endswith("}"):
+            return text.upper()
+        return "{" + text.upper() + "}"
+
+    @staticmethod
+    def _encode_identifier(text: str) -> str:
+        return ",".join(str(ord(ch)) for ch in text)
+
+    def add_footprint(
+        self,
+        name: str,
+        *,
+        height: str = "0mil",
+        description: str = "",
+        item_guid: str = "",
+        revision_guid: str = "",
+        component_guid: uuid.UUID | None = None,
+    ) -> AltiumPcbFootprint:
+        """
+        Create and register a new footprint owned by this library builder.
+        """
+        footprint = AltiumPcbFootprint(name)
+        footprint.parameters.update(
+            {
+                "PATTERN": name,
+                "HEIGHT": height,
+                "DESCRIPTION": description,
+                "ITEMGUID": item_guid,
+                "REVISIONGUID": revision_guid,
+            }
+        )
+        spec = PcbLibFootprintSpec(
+            footprint=footprint,
+            height=height,
+            description=description,
+            item_guid=item_guid,
+            revision_guid=revision_guid,
+            component_guid=component_guid or uuid.uuid4(),
+        )
+        self._footprints.append(spec)
+        footprint._bind_authoring_builder(self)
+        return footprint
+
+    def add_existing_footprint(
+        self,
+        footprint: AltiumPcbFootprint,
+        *,
+        height: str | None = None,
+        description: str | None = None,
+        item_guid: str | None = None,
+        revision_guid: str | None = None,
+        component_guid: uuid.UUID | None = None,
+        copy_footprint: bool = True,
+    ) -> AltiumPcbFootprint:
+        owned_footprint = copy.deepcopy(footprint) if copy_footprint else footprint
+
+        if not owned_footprint._record_order:
+            for collection in (
+                owned_footprint.pads,
+                owned_footprint.tracks,
+                owned_footprint.arcs,
+                owned_footprint.vias,
+                owned_footprint.fills,
+                owned_footprint.texts,
+                owned_footprint.regions,
+                owned_footprint.component_bodies,
+            ):
+                owned_footprint._record_order.extend(collection)
+
+        resolved_height = (
+            height
+            if height is not None
+            else owned_footprint.parameters.get("HEIGHT", "0mil")
+        )
+        resolved_description = (
+            description
+            if description is not None
+            else owned_footprint.parameters.get("DESCRIPTION", "")
+        )
+        resolved_item_guid = (
+            item_guid
+            if item_guid is not None
+            else owned_footprint.parameters.get("ITEMGUID", "")
+        )
+        resolved_revision_guid = (
+            revision_guid
+            if revision_guid is not None
+            else owned_footprint.parameters.get("REVISIONGUID", "")
+        )
+
+        owned_footprint.parameters.update(
+            {
+                "PATTERN": owned_footprint.name,
+                "HEIGHT": resolved_height,
+                "DESCRIPTION": resolved_description,
+                "ITEMGUID": resolved_item_guid,
+                "REVISIONGUID": resolved_revision_guid,
+            }
+        )
+
+        spec = PcbLibFootprintSpec(
+            footprint=owned_footprint,
+            height=resolved_height,
+            description=resolved_description,
+            item_guid=resolved_item_guid,
+            revision_guid=resolved_revision_guid,
+            component_guid=component_guid or uuid.uuid4(),
+            preserved_primitive_guids=(
+                owned_footprint.raw_primitive_guids if component_guid is None else None
+            ),
+            preserved_primitive_guids_header=(
+                owned_footprint.raw_primitive_guids_header
+                if component_guid is None
+                else None
+            ),
+            preserved_uniqueid_info=owned_footprint.raw_uniqueid_info,
+            preserved_uniqueid_info_header=owned_footprint.raw_uniqueid_info_header,
+        )
+
+        self._sync_footprint_widestrings(spec)
+        _import_primitive_guid_records(spec, owned_footprint.raw_primitive_guids)
+        _import_primitive_unique_id_records(spec, owned_footprint.raw_uniqueid_info)
+        if component_guid is not None:
+            spec.component_guid = component_guid
+
+        self._footprints.append(spec)
+        owned_footprint._bind_authoring_builder(self)
+        return owned_footprint
+
+    def rename_footprint(
+        self,
+        footprint_or_name: AltiumPcbFootprint | str,
+        name: str,
+    ) -> AltiumPcbFootprint:
+        """Rename one footprint owned by this builder."""
+        footprint = self._resolve_owned_footprint(footprint_or_name)
+        if footprint.name == name:
+            return footprint
+
+        names = [
+            name if spec.footprint is footprint else spec.footprint.name
+            for spec in self._footprints
+        ]
+        _plan_pcblib_storage_names(names)
+        footprint_index = next(
+            index
+            for index, spec in enumerate(self._footprints)
+            if spec.footprint is footprint
+        )
+        candidate = copy.deepcopy(self)
+        candidate._apply_footprint_name(
+            candidate._footprints[footprint_index].footprint,
+            name,
+        )
+        candidate_library = candidate.build()
+        candidate_library._stage_pcblib_writer(preflight_container=True)
+        self._apply_footprint_name(footprint, name)
+        return footprint
+
+    def _resolve_owned_footprint(
+        self,
+        footprint_or_name: AltiumPcbFootprint | str,
+    ) -> AltiumPcbFootprint:
+        if isinstance(footprint_or_name, str):
+            for spec in self._footprints:
+                if spec.footprint.name == footprint_or_name:
+                    return spec.footprint
+            raise ValueError(
+                f"footprint {footprint_or_name!r} is not owned by this library"
+            )
+        if not isinstance(footprint_or_name, AltiumPcbFootprint):
+            raise ValueError("footprint is not owned by this library")
+        for spec in self._footprints:
+            if spec.footprint is footprint_or_name:
+                return footprint_or_name
+        raise ValueError("footprint is not owned by this library")
+
+    @staticmethod
+    def _apply_footprint_name(
+        footprint: AltiumPcbFootprint,
+        name: str,
+    ) -> None:
+        footprint.name = name
+        footprint.parameters["PATTERN"] = name
+
+    @staticmethod
+    def _mil_to_internal_units(value_mil: float) -> int:
+        return int(round(float(value_mil) * 10000.0))
+
+    def _spec_for_footprint(self, footprint: AltiumPcbFootprint) -> PcbLibFootprintSpec:
+        for spec in self._footprints:
+            if spec.footprint is footprint:
+                return spec
+        raise KeyError(f"Footprint is not owned by this builder: {footprint.name}")
+
+    def _next_widestring_index(self, spec: PcbLibFootprintSpec) -> int:
+        if not spec.widestrings:
+            return 0
+        return max(spec.widestrings) + 1
+
+    def _sync_footprint_widestrings(self, spec: PcbLibFootprintSpec) -> None:
+        synced_widestrings: dict[int, str] = {}
+        used_indices: set[int] = set()
+        for text_record in spec.footprint.texts:
+            wide_index = (
+                int(text_record.widestring_index)
+                if text_record.widestring_index is not None
+                else 0
+            )
+            if text_record.widestring_index is None:
+                text_record.widestring_index = wide_index
+            if wide_index in used_indices:
+                wide_index = 0
+                while wide_index in used_indices:
+                    wide_index += 1
+                text_record.widestring_index = wide_index
+            used_indices.add(wide_index)
+            synced_widestrings[wide_index] = text_record.text_content or ""
+        spec.widestrings = synced_widestrings
+
+    def _ensure_primitive_guid(
+        self, spec: PcbLibFootprintSpec, primitive: object
+    ) -> uuid.UUID:
+        guid = spec.primitive_guids.get(primitive)
+        if guid is None:
+            guid = uuid.uuid4()
+            spec.primitive_guids[primitive] = guid
+        return guid
+
+    def _ensure_primitive_unique_id(
+        self, spec: PcbLibFootprintSpec, primitive: object
+    ) -> str:
+        unique_id = spec.primitive_unique_ids.get(primitive)
+        if unique_id is None:
+            unique_id = generate_unique_id()
+            spec.primitive_unique_ids[primitive] = unique_id
+        return unique_id
+
+    @staticmethod
+    def _primitive_guid_type_id(primitive: object) -> int:
+        if isinstance(primitive, AltiumPcbArc):
+            return 0x01
+        if isinstance(primitive, AltiumPcbPad):
+            return 0x02
+        if isinstance(primitive, AltiumPcbVia):
+            return 0x03
+        if isinstance(primitive, AltiumPcbTrack):
+            return 0x04
+        if isinstance(primitive, AltiumPcbText):
+            return 0x05
+        if isinstance(primitive, AltiumPcbFill):
+            return 0x06
+        if isinstance(primitive, AltiumPcbRegion):
+            return 0x0B
+        if isinstance(primitive, AltiumPcbShapeBasedRegion):
+            return 0x0B
+        if isinstance(primitive, AltiumPcbComponentBody):
+            return 0x5A
+        raise TypeError(f"Unsupported primitive GUID type: {type(primitive).__name__}")
+
+    def _build_footprint_primitive_guids(self, spec: PcbLibFootprintSpec) -> bytes:
+        records = bytearray()
+        for index, primitive in enumerate(spec.footprint._record_order):
+            records.extend(
+                _build_primitive_guid_record(
+                    self._primitive_guid_type_id(primitive),
+                    index,
+                    self._ensure_primitive_guid(spec, primitive),
+                )
+            )
+        records.extend(_build_primitive_guid_record(0x55, 0, spec.component_guid))
+        return bytes(records)
+
+    def _build_footprint_uniqueid_info(self, spec: PcbLibFootprintSpec) -> bytes | None:
+        records = bytearray()
+        for index, primitive in enumerate(spec.footprint._record_order):
+            if not isinstance(primitive, AltiumPcbPad):
+                continue
+            body = (
+                f"|PRIMITIVEINDEX={index}"
+                f"|PRIMITIVEOBJECTID=Pad"
+                f"|UNIQUEID={self._ensure_primitive_unique_id(spec, primitive)}\x00"
+            ).encode("ascii")
+            records.extend(struct.pack("<I", len(body)))
+            records.extend(body)
+        return bytes(records) if records else None
+
+    def _append_primitive(
+        self, footprint: AltiumPcbFootprint, primitive: object
+    ) -> None:
+        spec = self._spec_for_footprint(footprint)
+        spec.preserved_primitive_guids = None
+        spec.preserved_primitive_guids_header = None
+        spec.preserved_uniqueid_info = None
+        spec.preserved_uniqueid_info_header = None
+        if isinstance(primitive, AltiumPcbPad):
+            footprint.pads.append(primitive)
+        elif isinstance(primitive, AltiumPcbVia):
+            footprint.vias.append(primitive)
+        elif isinstance(primitive, AltiumPcbTrack):
+            footprint.tracks.append(primitive)
+        elif isinstance(primitive, AltiumPcbArc):
+            footprint.arcs.append(primitive)
+        elif isinstance(primitive, AltiumPcbFill):
+            footprint.fills.append(primitive)
+        elif isinstance(primitive, AltiumPcbText):
+            footprint.texts.append(primitive)
+        elif isinstance(primitive, AltiumPcbRegion):
+            footprint.regions.append(primitive)
+        elif isinstance(primitive, AltiumPcbShapeBasedRegion):
+            footprint.regions.append(primitive)
+        elif isinstance(primitive, AltiumPcbComponentBody):
+            footprint.component_bodies.append(primitive)
+        else:
+            raise TypeError(
+                f"Unsupported footprint primitive type: {type(primitive).__name__}"
+            )
+        footprint._record_order.append(primitive)
+        self._ensure_primitive_guid(spec, primitive)
+        if isinstance(primitive, AltiumPcbPad):
+            self._ensure_primitive_unique_id(spec, primitive)
+
+    def add_embedded_model(
+        self,
+        *,
+        name: str,
+        model_data: bytes,
+        model_id: uuid.UUID | str | None = None,
+        rotation_x_degrees: float = 0.0,
+        rotation_y_degrees: float = 0.0,
+        rotation_z_degrees: float = 0.0,
+        z_offset_mil: float = 0.0,
+        checksum: int | None = None,
+        model_source: str = "Undefined",
+        data_is_compressed: bool = False,
+    ) -> AltiumPcbModel:
+        """
+        Add an embedded 3D model payload to the library.
+
+        When `checksum` is omitted, the checksum is computed with Altium's
+        native byte-weighted model checksum algorithm. Pass `checksum` only
+        when preserving source metadata exactly during a copy workflow.
+
+        Args:
+            name: Model filename stored in `Library/Models/Data`.
+            model_data: Model payload bytes. Pass uncompressed bytes by default,
+                or zlib-compressed payload stream bytes when
+                `data_is_compressed=True`.
+            model_id: Optional model GUID. A new GUID is generated when omitted;
+                pass a deterministic GUID only for repeatable generated output.
+            rotation_x_degrees: Default model X-axis rotation in degrees.
+            rotation_y_degrees: Default model Y-axis rotation in degrees.
+            rotation_z_degrees: Default model Z-axis rotation in degrees.
+            z_offset_mil: Default model Z offset in mils.
+            checksum: Optional native checksum override for metadata-preserving
+                copy workflows.
+            model_source: Altium model source string.
+            data_is_compressed: True when `model_data` is already a compressed
+                `Library/Models/<n>` payload.
+
+        Returns:
+            The authored embedded model metadata object.
+        """
+        model = AltiumPcbModel()
+        model.name = name
+        model.id = self._format_model_id(model_id)
+        model.is_embedded = True
+        model.model_source = model_source
+        model.rotation_x = float(rotation_x_degrees)
+        model.rotation_y = float(rotation_y_degrees)
+        model.rotation_z = float(rotation_z_degrees)
+        model.z_offset = float(self._mil_to_internal_units(z_offset_mil))
+
+        if data_is_compressed:
+            embedded_payload = bytes(model_data)
+            try:
+                checksum_source = zlib.decompress(embedded_payload)
+            except zlib.error:
+                checksum_source = embedded_payload
+        else:
+            checksum_source = bytes(model_data)
+            embedded_payload = zlib.compress(checksum_source)
+
+        model.checksum = (
+            compute_altium_model_checksum(checksum_source)
+            if checksum is None
+            else int(checksum)
+        )
+        model.embedded_data = checksum_source
+        self._embedded_models.append(
+            PcbLibModelSpec(model=model, embedded_payload=embedded_payload)
+        )
+        return model
+
+    def add_pad(
+        self,
+        footprint: AltiumPcbFootprint,
+        *,
+        designator: str,
+        x_mil: float,
+        y_mil: float,
+        width_mil: float,
+        height_mil: float,
+        layer: PcbLayerLike = PcbLayer.TOP,
+        shape: int | str | PadShape = PadShape.RECTANGLE,
+        rotation_degrees: float = 0.0,
+        hole_size_mil: float = 0.0,
+        plated: bool | None = None,
+        corner_radius_percent: int | float | None = None,
+        top_shape: int | str | PadShape | None = None,
+        top_width_mils: float | None = None,
+        top_height_mils: float | None = None,
+        mid_shape: int | str | PadShape | None = None,
+        mid_width_mils: float | None = None,
+        mid_height_mils: float | None = None,
+        bottom_shape: int | str | PadShape | None = None,
+        bottom_width_mils: float | None = None,
+        bottom_height_mils: float | None = None,
+        pad_mode: int | None = None,
+        slot_length_mil: float = 0.0,
+        slot_rotation_degrees: float = 0.0,
+        hole_shape: int | str | PadHoleShape = PadHoleShape.ROUND,
+        solder_mask_expansion: PcbMaskExpansionInput = None,
+        solder_mask_expansion_mode: PcbMaskExpansionModeInput | None = None,
+        solder_mask_expansion_mils: float | None = None,
+        paste_mask_expansion: PcbMaskExpansionInput = None,
+        paste_mask_expansion_mode: PcbMaskExpansionModeInput | None = None,
+        paste_mask_expansion_mils: float | None = None,
+        hole_positive_tolerance_mil: float | None = None,
+        hole_negative_tolerance_mil: float | None = None,
+        is_test_fab_top: bool = False,
+        is_test_fab_bottom: bool = False,
+        is_assy_testpoint_top: bool = False,
+        is_assy_testpoint_bottom: bool = False,
+    ) -> AltiumPcbPad:
+        """
+        Add a simple pad primitive to a footprint.
+        """
+        pad = AltiumPcbPad()
+        layer_storage = _coerce_pcb_pad_authoring_layer_storage(layer)
+        layer_id = layer_storage.legacy_layer_id
+        validate_non_negative(width_mil, "width_mil")
+        validate_non_negative(height_mil, "height_mil")
+        validate_non_negative(hole_size_mil, "hole_size_mil")
+        validate_non_negative(slot_length_mil, "slot_length_mil")
+        width_iu = self._mil_to_internal_units(width_mil)
+        height_iu = self._mil_to_internal_units(height_mil)
+        hole_iu = self._mil_to_internal_units(hole_size_mil)
+        slot_iu = self._mil_to_internal_units(slot_length_mil)
+        if slot_iu > 0 and hole_iu <= 0:
+            raise ValueError("slot_length_mil requires a positive hole_size_mil")
+        if slot_iu > 0 and slot_iu < hole_iu:
+            raise ValueError(
+                "slot_length_mil must be greater than or equal to hole_size_mil"
+            )
+        resolved_hole_shape = normalize_pad_hole_shape(hole_shape)
+        if slot_iu > 0:
+            if resolved_hole_shape not in (PadHoleShape.ROUND, PadHoleShape.SLOT):
+                raise ValueError("slotted pads cannot use square hole_shape")
+            resolved_hole_shape = PadHoleShape.SLOT
+        elif resolved_hole_shape == PadHoleShape.SLOT:
+            raise ValueError("hole_shape='slot' requires a positive slot_length_mil")
+        elif hole_iu <= 0 and resolved_hole_shape != PadHoleShape.ROUND:
+            raise ValueError("non-round hole_shape requires a positive hole_size_mil")
+        pad.designator = designator
+        pad.layer = layer_id
+        pad.x = self._mil_to_internal_units(x_mil)
+        pad.y = self._mil_to_internal_units(y_mil)
+        pad.width = width_iu
+        pad.height = height_iu
+        pad.top_width = width_iu
+        pad.top_height = height_iu
+        pad.mid_width = width_iu
+        pad.mid_height = height_iu
+        pad.bot_width = width_iu
+        pad.bot_height = height_iu
+        apply_authored_pad_shape(
+            pad,
+            shape=shape,
+            width_iu=width_iu,
+            height_iu=height_iu,
+            corner_radius_percent=corner_radius_percent,
+        )
+        pad.rotation = float(rotation_degrees)
+        pad.layer_v7_save_id = layer_storage.v7_saved_layer_id
+        pad.hole_size = hole_iu
+        pad.is_plated = bool(plated) if plated is not None else False
+        pad.net_index = None
+        pad.component_index = None
+        pad.is_test_fab_top = bool(is_test_fab_top)
+        pad.is_test_fab_bottom = bool(is_test_fab_bottom)
+        pad.is_assy_test_point_top = bool(is_assy_testpoint_top)
+        pad.is_assy_test_point_bottom = bool(is_assy_testpoint_bottom)
+        pad.polygon_index = 0xFFFF
+        pad.union_index = 0xFFFFFFFF
+        pad.pad_mode = 0
+        pad.user_routed = True
+        pad._flags = 0x000C
+        pad._subrecord2_data = _PAD_SUBRECORD2_DEFAULT
+        pad._subrecord3_data = _PAD_SUBRECORD3_DEFAULT
+        pad._subrecord4_data = _PAD_SUBRECORD4_DEFAULT
+        apply_authored_pad_local_stack(
+            pad,
+            base_shape=shape,
+            base_width_iu=width_iu,
+            base_height_iu=height_iu,
+            top_shape=top_shape,
+            top_width_iu=(
+                None
+                if top_width_mils is None
+                else self._mil_to_internal_units(top_width_mils)
+            ),
+            top_height_iu=(
+                None
+                if top_height_mils is None
+                else self._mil_to_internal_units(top_height_mils)
+            ),
+            mid_shape=mid_shape,
+            mid_width_iu=(
+                None
+                if mid_width_mils is None
+                else self._mil_to_internal_units(mid_width_mils)
+            ),
+            mid_height_iu=(
+                None
+                if mid_height_mils is None
+                else self._mil_to_internal_units(mid_height_mils)
+            ),
+            bottom_shape=bottom_shape,
+            bottom_width_iu=(
+                None
+                if bottom_width_mils is None
+                else self._mil_to_internal_units(bottom_width_mils)
+            ),
+            bottom_height_iu=(
+                None
+                if bottom_height_mils is None
+                else self._mil_to_internal_units(bottom_height_mils)
+            ),
+            pad_mode=pad_mode,
+            corner_radius_percent=corner_radius_percent,
+        )
+        apply_pcb_mask_expansion_to_pad(
+            pad,
+            paste=resolve_pcb_mask_expansion(
+                value=paste_mask_expansion,
+                mode=paste_mask_expansion_mode,
+                expansion_mils=paste_mask_expansion_mils,
+                field_name="paste_mask_expansion",
+            ),
+            solder=resolve_pcb_mask_expansion(
+                value=solder_mask_expansion,
+                mode=solder_mask_expansion_mode,
+                expansion_mils=solder_mask_expansion_mils,
+                field_name="solder_mask_expansion",
+            ),
+        )
+        if slot_iu > 0:
+            pad.hole_shape = SLOT_HOLE_SHAPE
+            pad.slot_size = slot_iu
+            pad.slot_rotation = float(slot_rotation_degrees)
+        elif resolved_hole_shape == PadHoleShape.SQUARE:
+            pad.hole_shape = SQUARE_HOLE_SHAPE
+        else:
+            pad.hole_shape = ROUND_HOLE_SHAPE
+        if (
+            hole_positive_tolerance_mil is not None
+            or hole_negative_tolerance_mil is not None
+        ):
+            pad.set_hole_tolerances_mils(
+                0.0
+                if hole_positive_tolerance_mil is None
+                else hole_positive_tolerance_mil,
+                0.0
+                if hole_negative_tolerance_mil is None
+                else hole_negative_tolerance_mil,
+            )
+        self._append_primitive(footprint, pad)
+        return pad
+
+    def add_custom_pad(
+        self,
+        footprint: AltiumPcbFootprint,
+        *,
+        designator: str,
+        x_mil: float,
+        y_mil: float,
+        outline_points_mil: list[tuple[float, float]],
+        layer: int | PcbLayer = PcbLayer.TOP,
+        offset_x_mil: float = 0.0,
+        offset_y_mil: float = 0.0,
+        anchor_diameter_mil: float = 1.0,
+        anchor_width_mil: float | None = None,
+        anchor_height_mil: float | None = None,
+        anchor_rotation_degrees: float = 0.0,
+        anchor_shape: int | str | PadShape = PadShape.CIRCLE,
+        pad_index: int | None = None,
+        hole_points_mil: list[list[tuple[float, float]]] | None = None,
+        outline_points_are_local: bool = True,
+        paste_rule_expansion: bool | None = None,
+        solder_rule_expansion: bool | None = None,
+        solder_mask_expansion: PcbMaskExpansionInput = None,
+        solder_mask_expansion_mode: PcbMaskExpansionModeInput | None = None,
+        solder_mask_expansion_mils: float | None = None,
+        paste_mask_expansion: PcbMaskExpansionInput = None,
+        paste_mask_expansion_mode: PcbMaskExpansionModeInput | None = None,
+        paste_mask_expansion_mils: float | None = None,
+    ) -> AltiumPcbPad:
+        """
+        Author a custom pad as Altium stores it: tiny anchor pad plus region.
+        """
+        if len(outline_points_mil) < 3:
+            raise ValueError("Custom pad outline requires at least 3 points")
+        anchor_width = (
+            float(anchor_diameter_mil)
+            if anchor_width_mil is None
+            else float(anchor_width_mil)
+        )
+        anchor_height = (
+            float(anchor_diameter_mil)
+            if anchor_height_mil is None
+            else float(anchor_height_mil)
+        )
+        if anchor_width <= 0.0 or anchor_height <= 0.0:
+            raise ValueError("Custom pad anchor dimensions must be positive")
+        if pad_index is not None and int(pad_index) <= 0:
+            raise ValueError("pad_index must be a positive 1-based native index")
+        resolved_anchor_shape = normalize_pad_shape(anchor_shape)
+
+        layer_id = int(layer)
+        pad = self.add_pad(
+            footprint,
+            designator=designator,
+            x_mil=x_mil,
+            y_mil=y_mil,
+            width_mil=anchor_width,
+            height_mil=anchor_height,
+            layer=layer_id,
+            shape=resolved_anchor_shape,
+            rotation_degrees=anchor_rotation_degrees,
+            solder_mask_expansion=resolve_pcb_mask_expansion_with_legacy_alias(
+                value=solder_mask_expansion,
+                mode=solder_mask_expansion_mode,
+                expansion_mils=solder_mask_expansion_mils,
+                legacy_rule_expansion=solder_rule_expansion,
+                field_name="solder_mask_expansion",
+            ),
+            paste_mask_expansion=resolve_pcb_mask_expansion_with_legacy_alias(
+                value=paste_mask_expansion,
+                mode=paste_mask_expansion_mode,
+                expansion_mils=paste_mask_expansion_mils,
+                legacy_rule_expansion=paste_rule_expansion,
+                field_name="paste_mask_expansion",
+            ),
+        )
+        native_pad_index = len(footprint.pads)
+        region_pad_index = native_pad_index if pad_index is None else int(pad_index)
+
+        offset_x_iu = self._mil_to_internal_units(offset_x_mil)
+        offset_y_iu = self._mil_to_internal_units(offset_y_mil)
+        if offset_x_iu or offset_y_iu:
+            pad.hole_offset_x = [offset_x_iu] * 32
+            pad.hole_offset_y = [offset_y_iu] * 32
+            pad.alt_shape = [int(resolved_anchor_shape)] * 32
+            pad.corner_radius = [0] * 32
+
+        center_x_mil = float(x_mil) + float(offset_x_mil)
+        center_y_mil = float(y_mil) + float(offset_y_mil)
+
+        def _to_absolute(
+            points: list[tuple[float, float]],
+        ) -> list[tuple[float, float]]:
+            if not outline_points_are_local:
+                return list(points)
+            return [
+                (center_x_mil + float(px), center_y_mil + float(py))
+                for px, py in points
+            ]
+
+        region = self.add_region(
+            footprint,
+            outline_points_mil=_to_absolute(outline_points_mil),
+            layer=layer_id,
+            hole_points_mil=[_to_absolute(hole) for hole in (hole_points_mil or [])],
+            kind=0,
+            is_shapebased=True,
+        )
+        shape_region = AltiumPcbShapeBasedRegion()
+        shape_region.layer = layer_id
+        shape_region.is_shapebased = True
+        shape_region.properties = {
+            "V7_LAYER": PcbLayer(layer_id).to_json_name(),
+            "NAME": " ",
+            "KIND": "0",
+            "SUBPOLYINDEX": "-1",
+            "UNIONINDEX": "0",
+            "ARCRESOLUTION": "0.1mil",
+            "ISSHAPEBASED": "TRUE",
+            "CAVITYHEIGHT": "0mil",
+            "PADINDEX": str(region_pad_index),
+        }
+        absolute_outline = _to_absolute(outline_points_mil)
+        outline_vertices: list[PcbExtendedVertex] = []
+        for point_x_mil, point_y_mil in absolute_outline:
+            vertex = PcbExtendedVertex()
+            vertex.is_round = False
+            vertex.x = self._mil_to_internal_units(point_x_mil)
+            vertex.y = self._mil_to_internal_units(point_y_mil)
+            vertex.center_x = 0
+            vertex.center_y = 0
+            vertex.radius = 0
+            vertex.start_angle = 0.0
+            vertex.end_angle = 0.0
+            outline_vertices.append(vertex)
+        if outline_vertices:
+            closing = PcbExtendedVertex()
+            first = outline_vertices[0]
+            closing.is_round = first.is_round
+            closing.x = first.x
+            closing.y = first.y
+            closing.center_x = first.center_x
+            closing.center_y = first.center_y
+            closing.radius = first.radius
+            closing.start_angle = first.start_angle
+            closing.end_angle = first.end_angle
+            outline_vertices.append(closing)
+        shape_region.outline = outline_vertices
+
+        attach_custom_pad_shape(
+            pad,
+            source="builder",
+            region=region,
+            shape_region=shape_region,
+            pad_index=region_pad_index - 1,
+            shape_kind=int(PadShape.CUSTOM),
+        )
+        region.properties = build_pcblib_custom_pad_region_properties(
+            region=region,
+            shape_region=shape_region,
+            pad_index=region_pad_index,
+        )
+        primitive_index = footprint._record_order.index(region)
+        footprint.extended_primitive_information.append(
+            build_pcblib_custom_pad_extended_info(
+                primitive_index=primitive_index,
+                pad=pad,
+            )
+        )
+        return pad
+
+    def add_track(
+        self,
+        footprint: AltiumPcbFootprint,
+        *,
+        start_x_mil: float,
+        start_y_mil: float,
+        end_x_mil: float,
+        end_y_mil: float,
+        width_mil: float,
+        layer: PcbLayerLike = PcbLayer.TOP_OVERLAY,
+        v7_layer_id: int | None = None,
+        solder_mask_expansion_mil: float | None = None,
+        paste_mask_expansion_mil: float | None = None,
+    ) -> AltiumPcbTrack:
+        """
+        Add a track primitive to a footprint.
+        """
+        track = AltiumPcbTrack()
+        layer_storage = _coerce_pcb_authoring_layer_storage(
+            layer,
+            explicit_v7_saved_layer_id=v7_layer_id,
+        )
+        track.layer = layer_storage.legacy_layer_id
+        track.v7_layer_id = layer_storage.v7_saved_layer_id
+        self._register_extended_mechanical_primitive_layer(track.layer_state().ref)
+        track.start_x = self._mil_to_internal_units(start_x_mil)
+        track.start_y = self._mil_to_internal_units(start_y_mil)
+        track.end_x = self._mil_to_internal_units(end_x_mil)
+        track.end_y = self._mil_to_internal_units(end_y_mil)
+        track.width = self._mil_to_internal_units(width_mil)
+        track.component_index = None
+        track.net_index = None
+        track.polygon_index = 0
+        track.subpoly_index = 0
+        track.union_index = 0xFFFFFFFF
+        track.is_locked = False
+        track.is_keepout = False
+        track.is_polygon_outline = False
+        track.user_routed = True
+        track.solder_mask_expansion = (
+            0
+            if solder_mask_expansion_mil is None
+            else self._mil_to_internal_units(solder_mask_expansion_mil)
+        )
+        track.paste_mask_expansion = (
+            0
+            if paste_mask_expansion_mil is None
+            else self._mil_to_internal_units(paste_mask_expansion_mil)
+        )
+        track.keepout_restrictions = 0
+        track._original_content_len = 49
+        self._append_primitive(footprint, track)
+        return track
+
+    def add_arc(
+        self,
+        footprint: AltiumPcbFootprint,
+        *,
+        center_x_mil: float,
+        center_y_mil: float,
+        radius_mil: float,
+        start_angle_degrees: float,
+        end_angle_degrees: float,
+        width_mil: float,
+        layer: PcbLayerLike = PcbLayer.TOP_OVERLAY,
+        v7_layer_id: int | None = None,
+        solder_mask_expansion_mil: float | None = None,
+        paste_mask_expansion_mil: float | None = None,
+    ) -> AltiumPcbArc:
+        arc = AltiumPcbArc()
+        layer_storage = _coerce_pcb_authoring_layer_storage(
+            layer,
+            explicit_v7_saved_layer_id=v7_layer_id,
+        )
+        arc.layer = layer_storage.legacy_layer_id
+        arc.v7_layer_id = layer_storage.v7_saved_layer_id
+        self._register_extended_mechanical_primitive_layer(arc.layer_state().ref)
+        arc.center_x = self._mil_to_internal_units(center_x_mil)
+        arc.center_y = self._mil_to_internal_units(center_y_mil)
+        arc.radius = self._mil_to_internal_units(radius_mil)
+        arc.start_angle = float(start_angle_degrees)
+        arc.end_angle = float(end_angle_degrees)
+        arc.width = self._mil_to_internal_units(width_mil)
+        arc.component_index = None
+        arc.net_index = None
+        arc.polygon_index = 0
+        arc.subpoly_index = 0
+        arc.union_index = 0xFFFFFFFF
+        arc.is_locked = False
+        arc.is_keepout = False
+        arc.is_polygon_outline = False
+        arc.user_routed = True
+        arc.solder_mask_expansion = (
+            0
+            if solder_mask_expansion_mil is None
+            else self._mil_to_internal_units(solder_mask_expansion_mil)
+        )
+        arc.paste_mask_expansion = (
+            0
+            if paste_mask_expansion_mil is None
+            else self._mil_to_internal_units(paste_mask_expansion_mil)
+        )
+        arc.keepout_restrictions = 0
+        arc._original_content_len = 60
+        self._append_primitive(footprint, arc)
+        return arc
+
+    def add_fill(
+        self,
+        footprint: AltiumPcbFootprint,
+        *,
+        pos1_x_mil: float,
+        pos1_y_mil: float,
+        pos2_x_mil: float,
+        pos2_y_mil: float,
+        layer: PcbLayerLike = PcbLayer.TOP_OVERLAY,
+        rotation_degrees: float = 0.0,
+        v7_layer_id: int | None = None,
+        solder_mask_expansion_mil: float | None = None,
+        paste_mask_expansion_mil: float | None = None,
+    ) -> AltiumPcbFill:
+        fill = AltiumPcbFill()
+        layer_storage = _coerce_pcb_authoring_layer_storage(
+            layer,
+            explicit_v7_saved_layer_id=v7_layer_id,
+        )
+        fill.layer = layer_storage.legacy_layer_id
+        fill.v7_layer_id = layer_storage.v7_saved_layer_id
+        self._register_extended_mechanical_primitive_layer(fill.layer_state().ref)
+        fill.pos1_x = self._mil_to_internal_units(pos1_x_mil)
+        fill.pos1_y = self._mil_to_internal_units(pos1_y_mil)
+        fill.pos2_x = self._mil_to_internal_units(pos2_x_mil)
+        fill.pos2_y = self._mil_to_internal_units(pos2_y_mil)
+        fill.rotation = float(rotation_degrees)
+        fill.component_index = None
+        fill.net_index = None
+        fill.polygon_index = 0xFFFF
+        fill.union_index = 0xFFFFFFFF
+        fill.is_locked = False
+        fill.is_keepout = False
+        fill.is_polygon_outline = False
+        fill.user_routed = True
+        fill.solder_mask_expansion = (
+            0
+            if solder_mask_expansion_mil is None
+            else self._mil_to_internal_units(solder_mask_expansion_mil)
+        )
+        fill.paste_mask_expansion = (
+            0
+            if paste_mask_expansion_mil is None
+            else self._mil_to_internal_units(paste_mask_expansion_mil)
+        )
+        fill.keepout_restrictions = 0
+        fill._original_content_len = 50
+        self._append_primitive(footprint, fill)
+        return fill
+
+    def add_via(
+        self,
+        footprint: AltiumPcbFootprint,
+        *,
+        x_mil: float,
+        y_mil: float,
+        diameter_mil: float,
+        hole_size_mil: float,
+        layer_start: PcbLayerLike = PcbLayer.TOP,
+        layer_end: PcbLayerLike = PcbLayer.BOTTOM,
+        ipc4761_via_type: int | PcbIpc4761ViaType = PcbIpc4761ViaType.NONE,
+        ipc4761_features: Sequence[AltiumPcbViaStructureFeature] | None = None,
+        propagation_delay_ps: float | None = None,
+        hole_positive_tolerance_mil: float | None = None,
+        hole_negative_tolerance_mil: float | None = None,
+        is_tent_top: bool | None = None,
+        is_tent_bottom: bool | None = None,
+        solder_mask_expansion_top_mil: float | None = None,
+        solder_mask_expansion_bottom_mil: float | None = None,
+        is_test_fab_top: bool = False,
+        is_test_fab_bottom: bool = False,
+        is_assy_testpoint_top: bool = False,
+        is_assy_testpoint_bottom: bool = False,
+    ) -> AltiumPcbVia:
+        start_storage = _coerce_pcb_via_span_layer_storage(
+            layer_start,
+            field_name="layer_start",
+        )
+        end_storage = _coerce_pcb_via_span_layer_storage(
+            layer_end,
+            field_name="layer_end",
+        )
+        via = AltiumPcbVia()
+        via.layer = int(PcbLayer.MULTI_LAYER)
+        via.net_index = None
+        via.component_index = None
+        via.polygon_index = 0xFFFF
+        via.x = self._mil_to_internal_units(x_mil)
+        via.y = self._mil_to_internal_units(y_mil)
+        via.diameter = self._mil_to_internal_units(diameter_mil)
+        via.hole_size = self._mil_to_internal_units(hole_size_mil)
+        via.layer_start = start_storage.legacy_layer_id
+        via.layer_end = end_storage.legacy_layer_id
+        via.via_mode = 0
+        via.union_index = 0
+        via.ipc4761_via_type = PcbIpc4761ViaType(int(ipc4761_via_type))
+        via.via_structure = authored_via_structure_for_type(
+            via.ipc4761_via_type,
+            ipc4761_features,
+        )
+        if propagation_delay_ps is not None:
+            via.propagation_delay_ps = float(propagation_delay_ps)
+        via.is_test_fab_top = bool(is_test_fab_top)
+        via.is_test_fab_bottom = bool(is_test_fab_bottom)
+        via.is_assy_testpoint_top = bool(is_assy_testpoint_top)
+        via.is_assy_testpoint_bottom = bool(is_assy_testpoint_bottom)
+        via.diameter_by_layer = [0] * 32
+        for layer_id in range(
+            min(via.layer_start, via.layer_end), max(via.layer_start, via.layer_end) + 1
+        ):
+            if 1 <= layer_id <= 32:
+                via.diameter_by_layer[layer_id - 1] = via.diameter
+        apply_authored_via_surface_policy(
+            via,
+            is_tent_top=is_tent_top,
+            is_tent_bottom=is_tent_bottom,
+            solder_mask_expansion_top_mil=solder_mask_expansion_top_mil,
+            solder_mask_expansion_bottom_mil=solder_mask_expansion_bottom_mil,
+        )
+        if (
+            hole_positive_tolerance_mil is not None
+            or hole_negative_tolerance_mil is not None
+        ):
+            via.set_hole_tolerances_mils(
+                0.0
+                if hole_positive_tolerance_mil is None
+                else hole_positive_tolerance_mil,
+                0.0
+                if hole_negative_tolerance_mil is None
+                else hole_negative_tolerance_mil,
+            )
+        self._append_primitive(footprint, via)
+        return via
+
+    def add_region(
+        self,
+        footprint: AltiumPcbFootprint,
+        *,
+        outline_points_mil: list[tuple[float, float]],
+        layer: PcbLayerLike = PcbLayer.TOP,
+        hole_points_mil: list[list[tuple[float, float]]] | None = None,
+        kind: int = 0,
+        is_board_cutout: bool = False,
+        is_shapebased: bool = False,
+        is_keepout: bool = False,
+        keepout_restrictions: int = 0,
+        subpoly_index: int = 0,
+        cavity_height_mil: float = 0.0,
+        v7_layer: str | None = None,
+    ) -> AltiumPcbRegion:
+        if len(outline_points_mil) < 3:
+            raise ValueError("Region outline requires at least 3 points")
+
+        region = AltiumPcbRegion()
+        layer_storage, explicit_v7_layer_token = _coerce_region_authoring_layer_storage(
+            layer,
+            v7_layer,
+        )
+        region.layer = layer_storage.legacy_layer_id
+        region.net_index = None
+        region.component_index = None
+        region.polygon_index = 0xFFFF
+        region.is_locked = False
+        region.is_keepout = bool(is_keepout)
+        region.is_polygon_outline = False
+        semantic_kind = (
+            kind
+            if isinstance(kind, PcbRegionKind)
+            else pcb_region_kind_from_native_kind(
+                int(kind),
+                is_board_cutout=is_board_cutout,
+            )
+        )
+        region.kind = pcb_region_kind_to_native_kind(
+            semantic_kind,
+            is_board_cutout=is_board_cutout,
+        )
+        region.is_board_cutout = bool(is_board_cutout)
+        region.is_shapebased = bool(is_shapebased)
+        region.keepout_restrictions = int(keepout_restrictions)
+        region.subpoly_index = int(subpoly_index)
+        region.cavity_height = self._mil_to_internal_units(cavity_height_mil)
+        region.properties = {}
+        if (
+            explicit_v7_layer_token is not None
+            or layer_storage.ref.legacy_layer is None
+        ):
+            region.v7_layer = region_v7_layer_text(
+                layer_storage.ref,
+                explicit_v7_layer_token,
+            )
+        if region.cavity_height or semantic_kind == PcbRegionKind.CAVITY_DEFINITION:
+            region.v7_layer = region_v7_layer_text(
+                layer_storage.ref,
+                explicit_v7_layer_token,
+            )
+            region.properties["NAME"] = ""
+            region.properties["ARCRESOLUTION"] = "0.5mil"
+            region.properties["CAVITYHEIGHT"] = _format_mil_value(
+                float(cavity_height_mil)
+            )
+        region.outline_vertices = [
+            RegionVertex(
+                x_raw=float(self._mil_to_internal_units(x_mil)),
+                y_raw=float(self._mil_to_internal_units(y_mil)),
+            )
+            for x_mil, y_mil in outline_points_mil
+        ]
+        region.hole_vertices = [
+            [
+                RegionVertex(
+                    x_raw=float(self._mil_to_internal_units(x_mil)),
+                    y_raw=float(self._mil_to_internal_units(y_mil)),
+                )
+                for x_mil, y_mil in hole
+            ]
+            for hole in (hole_points_mil or [])
+        ]
+        region.outline_vertex_count = len(region.outline_vertices)
+        region.hole_count = len(region.hole_vertices)
+        try:
+            self._register_extended_mechanical_primitive_layer(region.layer_ref())
+        except PcbLayerResolutionError:
+            pass
+        self._append_primitive(footprint, region)
+        return region
+
+    def add_text(
+        self,
+        footprint: AltiumPcbFootprint,
+        *,
+        text: str,
+        x_mil: float,
+        y_mil: float,
+        height_mil: float,
+        layer: PcbLayerLike = PcbLayer.TOP_OVERLAY,
+        rotation_degrees: float = 0.0,
+        stroke_width_mil: float = 10.0,
+        font_kind: str = "stroke",
+        stroke_font_type: int | str = "default",
+        font_name: str = "Arial",
+        bold: bool = False,
+        italic: bool = False,
+        barcode_kind: int | PcbBarcodeKind = PcbBarcodeKind.CODE_39,
+        barcode_render_mode: int
+        | PcbBarcodeRenderMode = PcbBarcodeRenderMode.BY_FULL_WIDTH,
+        barcode_full_size_mils: tuple[float, float] | None = None,
+        barcode_margin_mils: tuple[float, float] = (
+            PCB_TEXT_BARCODE_MARGIN_MILS,
+            PCB_TEXT_BARCODE_MARGIN_MILS,
+        ),
+        barcode_min_width_mils: float = PCB_TEXT_BARCODE_MIN_WIDTH_MILS,
+        barcode_show_text: bool = True,
+        barcode_inverted: bool = True,
+        is_comment: bool = False,
+        is_designator: bool = False,
+        is_mirrored: bool = False,
+        is_inverted: bool = False,
+        inverted_margin_mil: float = 0.0,
+        use_inverted_rectangle: bool = False,
+        inverted_rectangle_size_mil: tuple[float, float] | None = None,
+        is_frame: bool = False,
+        frame_size_mil: tuple[float, float] | None = None,
+        text_justification: int | None = None,
+    ) -> AltiumPcbText:
+        """
+        Add a text primitive to a footprint.
+        """
+        spec = self._spec_for_footprint(footprint)
+        wide_index = self._next_widestring_index(spec)
+        spec.widestrings[wide_index] = text
+        text_record = build_authored_text(
+            text=text,
+            position_mils=(x_mil, y_mil),
+            height_mils=height_mil,
+            layer=layer,
+            rotation_degrees=rotation_degrees,
+            stroke_width_mils=stroke_width_mil,
+            font_kind=font_kind,
+            stroke_font_type=stroke_font_type,
+            font_name=font_name,
+            bold=bold,
+            italic=italic,
+            barcode_kind=barcode_kind,
+            barcode_render_mode=barcode_render_mode,
+            barcode_full_size_mils=barcode_full_size_mils,
+            barcode_margin_mils=barcode_margin_mils,
+            barcode_min_width_mils=barcode_min_width_mils,
+            barcode_show_text=barcode_show_text,
+            barcode_inverted=barcode_inverted,
+            is_comment=is_comment,
+            is_designator=is_designator,
+            is_mirrored=is_mirrored,
+            is_inverted=is_inverted,
+            inverted_margin_mils=inverted_margin_mil,
+            use_inverted_rectangle=use_inverted_rectangle,
+            inverted_rectangle_size_mils=inverted_rectangle_size_mil,
+            is_frame=is_frame,
+            frame_size_mils=frame_size_mil,
+            text_justification=text_justification,
+        )
+        text_record.net_index = None
+        text_record.component_index = None
+        text_record.widestring_index = wide_index
+        self._register_extended_mechanical_primitive_layer(
+            text_record.layer_state().ref
+        )
+        self._append_primitive(footprint, text_record)
+        return text_record
+
+    def add_component_body(
+        self,
+        footprint: AltiumPcbFootprint,
+        *,
+        outline_points_mil: list[tuple[float, float]],
+        layer: PcbLayerLike = PcbLayer.MECHANICAL_1,
+        overall_height_mil: float,
+        standoff_height_mil: float = 0.5,
+        cavity_height_mil: float = 0.0,
+        body_projection: PcbBodyProjection = PcbBodyProjection.TOP,
+        model: AltiumPcbModel | None = None,
+        model_2d_x_mil: float = 0.0,
+        model_2d_y_mil: float = 0.0,
+        model_2d_rotation_degrees: float = 0.0,
+        model_3d_rotx_degrees: float | None = None,
+        model_3d_roty_degrees: float | None = None,
+        model_3d_rotz_degrees: float | None = None,
+        model_3d_dz_mil: float | None = None,
+        model_checksum: int | None = None,
+        identifier: str | None = None,
+        name: str = " ",
+        body_color_3d: int = 0x808080,
+        body_opacity_3d: float = 1.0,
+        model_type: int = 1,
+        model_source: str | None = None,
+    ) -> AltiumPcbComponentBody:
+        if len(outline_points_mil) < 3:
+            raise ValueError("Component body outline requires at least 3 points")
+
+        layer_storage = _coerce_pcb_authoring_layer_storage(layer)
+        body = AltiumPcbComponentBody()
+        body.layer = layer_storage.legacy_layer_id
+        body.net_index = None
+        body.polygon_index = 0xFFFF
+        body.component_index = None
+        body.hole_count = 0
+        body.is_locked = False
+        body.is_keepout = False
+        body.kind = PcbRegionKind.COPPER
+        body.is_shapebased = False
+        body.subpoly_index = -1
+        body.union_index = 0
+        body.standoff_height = self._mil_to_internal_units(standoff_height_mil)
+        body.overall_height = self._mil_to_internal_units(overall_height_mil)
+        body.cavity_height = self._mil_to_internal_units(cavity_height_mil)
+        body.body_projection = body_projection
+        body.body_color_3d = int(body_color_3d)
+        body.body_opacity_3d = float(body_opacity_3d)
+        body.identifier = identifier or self._encode_identifier(footprint.name)
+        body.texture = ""
+        body.texture_center_x = 0
+        body.texture_center_y = 0
+        body.texture_size_x = 0
+        body.texture_size_y = 0
+        body.texture_rotation = 0.0
+        body.arc_resolution = 0.5
+        body.v7_layer = region_v7_layer_text(layer_storage.ref)
+        body.name = name
+        body._geometry_variant = (False, False)
+
+        outline: list[PcbExtendedVertex] = []
+        for x_mil, y_mil in outline_points_mil:
+            vertex = PcbExtendedVertex()
+            vertex.is_round = False
+            vertex.x = self._mil_to_internal_units(x_mil)
+            vertex.y = self._mil_to_internal_units(y_mil)
+            vertex.center_x = vertex.x
+            vertex.center_y = vertex.y
+            vertex.radius = 0
+            vertex.start_angle = 0.0
+            vertex.end_angle = 0.0
+            outline.append(vertex)
+        body.outline = outline
+        body.holes = []
+
+        if model is not None:
+            body.model_id = str(model.id)
+            body.model_checksum = (
+                int(model.checksum) if model_checksum is None else int(model_checksum)
+            )
+            body.model_is_embedded = bool(model.is_embedded)
+            body.model_name = str(model.name)
+            body.model_2d_x = self._mil_to_internal_units(model_2d_x_mil)
+            body.model_2d_y = self._mil_to_internal_units(model_2d_y_mil)
+            body.model_2d_rotation = float(model_2d_rotation_degrees)
+            body.model_3d_rotx = float(
+                model.rotation_x
+                if model_3d_rotx_degrees is None
+                else model_3d_rotx_degrees
+            )
+            body.model_3d_roty = float(
+                model.rotation_y
+                if model_3d_roty_degrees is None
+                else model_3d_roty_degrees
+            )
+            body.model_3d_rotz = float(
+                model.rotation_z
+                if model_3d_rotz_degrees is None
+                else model_3d_rotz_degrees
+            )
+            body.model_3d_dz = (
+                int(round(model.z_offset))
+                if model_3d_dz_mil is None
+                else self._mil_to_internal_units(model_3d_dz_mil)
+            )
+            body.model_type = int(model_type)
+            body.model_source = (
+                model.model_source if model_source is None else model_source
+            )
+
+        self._register_extended_mechanical_primitive_layer(body.layer_ref())
+        self._append_primitive(footprint, body)
+        return body
+
+    def add_component_body_rectangle(
+        self,
+        footprint: AltiumPcbFootprint,
+        *,
+        left_mil: float,
+        bottom_mil: float,
+        right_mil: float,
+        top_mil: float,
+        layer: PcbLayerLike = PcbLayer.MECHANICAL_1,
+        overall_height_mil: float,
+        standoff_height_mil: float = 0.5,
+        cavity_height_mil: float = 0.0,
+        body_projection: PcbBodyProjection = PcbBodyProjection.TOP,
+        model: AltiumPcbModel | None = None,
+        model_2d_x_mil: float = 0.0,
+        model_2d_y_mil: float = 0.0,
+        model_2d_rotation_degrees: float = 0.0,
+        model_3d_rotx_degrees: float | None = None,
+        model_3d_roty_degrees: float | None = None,
+        model_3d_rotz_degrees: float | None = None,
+        model_3d_dz_mil: float | None = None,
+        model_checksum: int | None = None,
+        identifier: str | None = None,
+        name: str = " ",
+        body_color_3d: int = 0x808080,
+        body_opacity_3d: float = 1.0,
+        model_type: int = 1,
+        model_source: str | None = None,
+    ) -> AltiumPcbComponentBody:
+        return self.add_component_body(
+            footprint,
+            outline_points_mil=[
+                (left_mil, bottom_mil),
+                (right_mil, bottom_mil),
+                (right_mil, top_mil),
+                (left_mil, top_mil),
+            ],
+            layer=layer,
+            overall_height_mil=overall_height_mil,
+            standoff_height_mil=standoff_height_mil,
+            cavity_height_mil=cavity_height_mil,
+            body_projection=body_projection,
+            model=model,
+            model_2d_x_mil=model_2d_x_mil,
+            model_2d_y_mil=model_2d_y_mil,
+            model_2d_rotation_degrees=model_2d_rotation_degrees,
+            model_3d_rotx_degrees=model_3d_rotx_degrees,
+            model_3d_roty_degrees=model_3d_roty_degrees,
+            model_3d_rotz_degrees=model_3d_rotz_degrees,
+            model_3d_dz_mil=model_3d_dz_mil,
+            model_checksum=model_checksum,
+            identifier=identifier,
+            name=name,
+            body_color_3d=body_color_3d,
+            body_opacity_3d=body_opacity_3d,
+            model_type=model_type,
+            model_source=model_source,
+        )
+
+    def _assign_storage_names(self) -> bytes | None:
+        entries: list[tuple[str, str]] = []
+        storage_names = _plan_pcblib_storage_names(
+            [spec.footprint.name for spec in self._footprints]
+        )
+        for spec, ole_name in zip(self._footprints, storage_names, strict=True):
+            full_name = spec.footprint.name
+            spec.footprint._ole_storage_name = ole_name
+            if ole_name != full_name:
+                entries.append((full_name, ole_name))
+        if not entries:
+            return None
+        return PcbLibSectionKeys(
+            entries=tuple(
+                PcbLibSectionKeyEntry(full_name=full_name, ole_key=ole_key)
+                for full_name, ole_key in entries
+            )
+        ).to_bytes()
+
+    def _build_component_params_toc(self) -> PcbLibComponentParamsToc:
+        return PcbLibComponentParamsToc(
+            entries=tuple(
+                PcbLibComponentParamsTocEntry(
+                    name=spec.footprint.name,
+                    pad_count=len(spec.footprint.pads),
+                    height=(
+                        spec.height[:-3] if spec.height.endswith("mil") else spec.height
+                    ),
+                    description=spec.description,
+                )
+                for spec in self._footprints
+            )
+        )
+
+    def build(self) -> AltiumPcbLib:
+        if not self._footprints:
+            raise ValueError("PcbLibBuilder requires at least one footprint")
+
+        pcblib = AltiumPcbLib()
+        pcblib.raw_file_header = self.profile.file_header.to_bytes()
+        pcblib.raw_library_header = PcbLibCountHeader.one().to_bytes()
+        pcblib.raw_embedded_fonts = PcbLibCountHeader.zero().to_bytes()
+        embedded_models = list(self._embedded_models)
+        pcblib.raw_models_header = PcbLibCountHeader(len(embedded_models)).to_bytes()
+        pcblib.raw_models_data = b"".join(
+            model_spec.model.serialize_to_binary() for model_spec in embedded_models
+        )
+        pcblib.raw_models = {
+            index: model_spec.embedded_payload
+            for index, model_spec in enumerate(embedded_models)
+        }
+        pcblib.raw_models_noembed_header = PcbLibCountHeader.zero().to_bytes()
+        pcblib.raw_models_noembed_data = b""
+        pcblib.raw_textures_header = PcbLibCountHeader.zero().to_bytes()
+        pcblib.raw_textures_data = b""
+        pcblib.raw_component_params_toc_header = PcbLibCountHeader.one().to_bytes()
+        pcblib.raw_component_params_toc_data = (
+            self._build_component_params_toc().to_bytes()
+        )
+        pcblib.raw_pad_via_library_header = PcbLibCountHeader.zero().to_bytes()
+        pcblib.raw_pad_via_library_data = self.profile.pad_via_library.to_bytes()
+        pcblib.raw_layer_kind_mapping_header = PcbLibCountHeader.one().to_bytes()
+        pcblib.raw_layer_kind_mapping = self.layer_kind_mapping_data.to_bytes()
+        pcblib._sync_layer_kind_mapping_from_raw()
+        pcblib.raw_file_version_info_header = PcbLibCountHeader.one().to_bytes()
+        pcblib.raw_file_version_info = PcbLibFileVersionInfo.default().to_bytes()
+        pcblib.raw_section_keys = self._assign_storage_names()
+        pcblib.raw_library_data = self.profile.library_data.build_stream(
+            [spec.footprint.name for spec in self._footprints]
+        )
+
+        for spec in self._footprints:
+            footprint = spec.footprint
+            primitive_count = len(footprint._record_order)
+            self._sync_footprint_widestrings(spec)
+            footprint.raw_data = footprint.serialize_data_stream()
+            footprint.raw_header = struct.pack("<I", primitive_count)
+            footprint.raw_parameters = _build_footprint_parameters(spec)
+            footprint.raw_widestrings = _build_footprint_widestrings(spec.widestrings)
+            footprint.raw_primitive_guids = (
+                spec.preserved_primitive_guids
+                if spec.preserved_primitive_guids is not None
+                else self._build_footprint_primitive_guids(spec)
+            )
+            footprint.raw_primitive_guids_header = (
+                spec.preserved_primitive_guids_header
+                if spec.preserved_primitive_guids_header is not None
+                else struct.pack("<I", primitive_count + 1)
+            )
+            if footprint.extended_primitive_information:
+                footprint.raw_extended_primitive_info = b"".join(
+                    item.serialize_record()
+                    for item in footprint.extended_primitive_information
+                )
+                footprint.raw_extended_primitive_info_header = struct.pack(
+                    "<I", len(footprint.extended_primitive_information)
+                )
+            elif footprint.raw_extended_primitive_info is not None:
+                footprint.raw_extended_primitive_info_header = (
+                    footprint.raw_extended_primitive_info_header
+                    if footprint.raw_extended_primitive_info_header is not None
+                    else struct.pack(
+                        "<I",
+                        _count_length_prefixed_records(
+                            footprint.raw_extended_primitive_info
+                        ),
+                    )
+                )
+            footprint.raw_uniqueid_info = (
+                spec.preserved_uniqueid_info
+                if spec.preserved_uniqueid_info is not None
+                else self._build_footprint_uniqueid_info(spec)
+            )
+            footprint.raw_uniqueid_info_header = (
+                spec.preserved_uniqueid_info_header
+                if spec.preserved_uniqueid_info is not None
+                else (
+                    struct.pack("<I", len(footprint.pads))
+                    if footprint.raw_uniqueid_info is not None
+                    else None
+                )
+            )
+            _sync_footprint_primitive_parameter_stream(footprint)
+            _sync_footprint_via_structure_streams(footprint)
+            pcblib.footprints.append(footprint)
+
+        pcblib._sync_footprint_svg_layer_cache()
+        return pcblib
+
+    def save(
+        self,
+        output_path: Path,
+        *,
+        synthesize_file_metadata: bool = False,
+        metadata_timestamp: datetime | None = None,
+        synthesize_view_configuration: bool = False,
+        current_view_state: str | None = None,
+        config_2d_full_filename: str | Path | None = None,
+        config_3d_full_filename: str | Path | None = None,
+    ) -> AltiumPcbLib:
+        """
+        Build the library and write it to disk.
+
+        This is the canonical public write path for builder output.
+        """
+        pcblib = self.build()
+        library_data = self.profile.library_data
+        if synthesize_file_metadata:
+            when = metadata_timestamp or datetime.now()
+            library_data = library_data.with_output_metadata(output_path, when)
+
+        should_synthesize_view_configuration = (
+            synthesize_view_configuration
+            or current_view_state is not None
+            or config_2d_full_filename is not None
+            or config_3d_full_filename is not None
+        )
+        if should_synthesize_view_configuration:
+            library_data = library_data.with_synthesized_view_configuration(
+                Path(output_path),
+                current_view_state=current_view_state or "2D",
+                config_2d_full_filename=config_2d_full_filename,
+                config_3d_full_filename=config_3d_full_filename,
+            )
+
+        if synthesize_file_metadata or should_synthesize_view_configuration:
+            pcblib.raw_library_data = library_data.build_stream(
+                [spec.footprint.name for spec in self._footprints]
+            )
+        pcblib.save(output_path)
+        return pcblib

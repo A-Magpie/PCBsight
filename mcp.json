@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "pcbsight": {
+      "command": "python",
+      "args": [
+        "${plugin_dir}/pcbsight_mcp.py"
+      ],
+      "env": {}
+    }
+  }
+}

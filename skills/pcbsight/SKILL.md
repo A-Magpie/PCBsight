@@ -5,20 +5,93 @@ description: Comprehensive inspection, parsing, and analysis of Altium Designer 
 
 # PCBsight - Altium Designer .PcbDoc Inspection & Analysis Skill
 
-**PCBsight** is a dedicated skill and toolkit for deep parsing, analyzing, and extracting all engineering data from Altium Designer `.PcbDoc` binary files without requiring Altium Designer or Windows GUI automation.
+**PCBsight** is a dedicated skill and toolkit for deep parsing, analyzing, and extracting 100% of engineering data from Altium Designer `.PcbDoc` binary files without requiring Altium Designer or Windows GUI automation.
+
+All dependencies (`olefile`, `altium_monkey`) are bundled in `scripts/vendor/`—zero external pip installation is required.
+
+---
+
+## Execution Modes (How to Run PCBsight)
+
+PCBsight can be executed in any AI agent environment (OpenAI Codex, ChatGPT Plugins, Claude Code, Antigravity, or Python Code Interpreter):
+
+### Mode 1: MCP Tools (Recommended when MCP tools are exposed)
+If you have access to the PCBsight MCP tools in your session, call them directly:
+- `pcbsight_inspect(file_path="...")` -> Returns board outline, dimensions, layers, component counts, routing length, rule counts.
+- `pcbsight_rules(file_path="...")` -> Audits clearance rules, design rules, and recorded DRC violations.
+- `pcbsight_layers(file_path="...")` -> Returns full physical layer stackup and dielectric properties.
+- `pcbsight_bom(file_path="...")` -> Returns placed components, footprints, MPN, and BOM breakdown.
+- `pcbsight_report(file_path="...", output_dir="./output", export_all=True)` -> Generates Markdown report, JSON dump, CSV tables, and SVG renders.
+
+### Mode 2: Command-Line Interface (CLI / Terminal)
+When a shell or terminal is available:
+```bash
+# 1. Quick Board Inspection
+python pcbsight.py inspect "<path_to_file.PcbDoc>"
+
+# 2. Design Rules & Clearance Audit
+python pcbsight.py rules "<path_to_file.PcbDoc>"
+
+# 3. Layer Stackup Table
+python pcbsight.py layers "<path_to_file.PcbDoc>"
+
+# 4. Generate Full Report & Export All Artifacts
+python pcbsight.py report "<path_to_file.PcbDoc>" --out ./output/ --export-all
+```
+*(If running from outside the repo, replace `pcbsight.py` with `<skill_dir>/pcbsight.py` or `<skill_dir>/scripts/cli.py`)*
+
+### Mode 3: Python Code Interpreter / Sandboxed Python (ChatGPT Web / Jupyter)
+When running inside a Python Code Interpreter sandbox:
+```python
+import sys
+import os
+
+# Automatically locate and add pcbsight scripts to sys.path
+candidate_dirs = [
+    os.getcwd(),
+    os.path.join(os.getcwd(), "skills", "pcbsight"),
+    os.path.join(os.getcwd(), "skills", "pcbsight", "scripts"),
+    os.path.join(os.getcwd(), "scripts"),
+]
+for d in candidate_dirs:
+    if os.path.exists(d) and d not in sys.path:
+        sys.path.insert(0, os.path.abspath(d))
+
+from pcbdoc_parser import PCBDocParser
+from pcb_analyzer import PCBAnalyzer
+from pcb_reporter import PcbReporter
+
+# 1. Parse board file
+parser = PCBDocParser("path/to/board.PcbDoc")
+result = parser.parse()
+
+# 2. Get comprehensive analysis summary
+analyzer = PCBAnalyzer(result)
+summary = analyzer.get_summary()
+print("Board Dimensions:", summary["dimensions"])
+print("Copper Layers:", summary["copper_layers"])
+print("Total Components:", summary["components"]["total_count"])
+print("Design Rules:", summary["rules"]["rule_count"])
+print("DRC Violations:", summary["rules"]["recorded_violations_count"])
+
+# 3. Export reports
+reporter = PcbReporter(result)
+md_report = reporter.to_markdown()
+reporter.to_json("board_data.json")
+```
 
 ---
 
 ## Capabilities & Extracted Data
 
-PCBsight parses and analyzes 100% of the PCB design database:
+PCBsight extracts and validates 100% of the PCB design database:
 
 1. **Board Outline & Dimensions (ابعاد و خط دور برد)**:
-   - Overall board width and height in both Metric (mm) and Imperial (mils).
+   - Overall board width and height in Metric (mm) and Imperial (mils).
    - Exact outline geometry (vertices, arcs, lines, origin).
    - Board cutouts and internal routing slots.
    - Net board area (mm² and sq inches).
-   - Minimum and maximum coordinate bounding box.
+   - Coordinate bounding box (Min/Max X, Y).
 
 2. **Layer Stackup (لایه ها)**:
    - Full physical layer stack (Top Layer, Bottom Layer, Mid 1..N, Internal Planes).
@@ -35,8 +108,8 @@ PCBsight parses and analyzes 100% of the PCB design database:
 
 4. **Silkscreen & Markings (مارکاژ و چاپ راهنما)**:
    - All text entities on `TOP_OVERLAY`, `BOTTOM_OVERLAY`, and mechanical layers.
-   - Distinction between component designators/comments and standalone board markings (e.g. board name, serial numbers, labels, logos, warnings).
-   - Font types (TrueType vs Stroke fonts vs Barcode), font names (e.g. Arial), heights, stroke widths, positions, and rotations.
+   - Component designators vs standalone board markings (board name, revision, serial numbers, labels, logos, warnings).
+   - Font types (TrueType vs Stroke fonts vs Barcode), heights, stroke widths, positions, and rotations.
 
 5. **Design Rules & Clearance (قوانین و کلیرنس)**:
    - Full rule database (35+ standard Altium rule types).
@@ -52,8 +125,8 @@ PCBsight parses and analyzes 100% of the PCB design database:
    - Violation coordinates (X, Y) and violation clearance gap measurements.
 
 7. **Components & Bill of Materials (قطعات و لیست قطعات)**:
-   - All placed components with Designator, Footprint pattern, Layer (Top/Bottom), Coordinates (X, Y), and Rotation.
-   - Parameter extraction: Manufacturer Part Number (MPN), Manufacturer Name, Value, Description, Package.
+   - Placed components with Designator, Footprint pattern, Layer (Top/Bottom), Coordinates (X, Y), and Rotation.
+   - Parameter extraction: MPN, Manufacturer Name, Value, Description, Package.
    - Automated SMD vs Through-Hole (THT) component classification.
    - Aggregated Bill of Materials (BOM) grouping.
 
@@ -70,87 +143,9 @@ PCBsight parses and analyzes 100% of the PCB design database:
 
 ---
 
-## Command-Line Usage (CLI)
-
-The CLI can be invoked globally from anywhere using:
-```powershell
-python "C:\Users\Sam13\.gemini\config\plugins\pcbsight\skills\pcbsight\pcbsight.py" <subcommand> "<path_to_file.PcbDoc>"
-```
-Or locally from `s:\My Computer\Work\MySkills\PCBsight\pcbsight.py`.
-
-### 1. Quick Board Inspection
-Prints an executive summary of dimensions, layers, component counts, routing length, and rule counts in the terminal:
-```powershell
-python "C:\Users\Sam13\.gemini\config\plugins\pcbsight\skills\pcbsight\pcbsight.py" inspect "<path_to_file.PcbDoc>"
-```
-
-### 2. Design Rules & Clearance Audit
-Displays all design rules, clearance gaps, and recorded DRC violations:
-```powershell
-python "C:\Users\Sam13\.gemini\config\plugins\pcbsight\skills\pcbsight\pcbsight.py" rules "<path_to_file.PcbDoc>"
-```
-
-### 3. Layer Stackup Table
-Displays the layer stackup and dielectric properties:
-```powershell
-python "C:\Users\Sam13\.gemini\config\plugins\pcbsight\skills\pcbsight\pcbsight.py" layers "<path_to_file.PcbDoc>"
-```
-
-### 4. Comprehensive Report & Export
-Generates a full Markdown report and JSON dump. Add `--export-all` to also export CSVs and SVG images:
-```powershell
-# Generate Markdown + JSON report
-python "C:\Users\Sam13\.gemini\config\plugins\pcbsight\skills\pcbsight\pcbsight.py" report "<path_to_file.PcbDoc>" --out ./output_folder/
-
-# Generate everything (Markdown, JSON, BOM CSV, Drills CSV, Nets CSV, SVGs)
-python "C:\Users\Sam13\.gemini\config\plugins\pcbsight\skills\pcbsight\pcbsight.py" report "<path_to_file.PcbDoc>" --out ./output_folder/ --export-all
-```
-
----
-
-## Python API Usage
-
-To use PCBsight inside custom Python scripts or automated pipelines:
-
-```python
-import sys
-sys.path.append(r"s:\My Computer\Work\MySkills\PCBsight\scripts")
-
-from pcbdoc_parser import PCBDocParser
-from pcb_analyzer import PCBAnalyzer
-from pcb_reporter import PcbReporter
-
-# 1. Parse the board file
-parser = PCBDocParser("board.PcbDoc")
-res = parser.parse()
-
-# 2. Access parsed data structures
-print(f"Board size: {res.dimensions.width_mm} x {res.dimensions.height_mm} mm")
-print(f"Copper layers: {res.copper_layer_count}")
-print(f"Total components: {res.statistics.total_components}")
-print(f"Clearance rules: {len(res.clearance_rules)}")
-print(f"Violations: {len(res.violations)}")
-
-# 3. Use the Analyzer for aggregated data
-analyzer = PCBAnalyzer(res)
-bom = analyzer.get_bom_summary()
-summary = analyzer.get_summary()
-
-# 4. Generate Reports and Exports
-reporter = PcbReporter(res)
-md_report = reporter.to_markdown()
-reporter.to_json("board_data.json")
-reporter.to_csv_bom("bom.csv")
-reporter.to_csv_drills("drills.csv")
-reporter.export_svgs("./svgs/")
-```
-
----
-
 ## Verification & Testing
 
-To run the automated test suite verifying all 9 core features against real Altium boards:
-```powershell
-python "s:\My Computer\Work\MySkills\PCBsight\tests\test_pcbsight.py"
+To run the automated test suite verifying all core features against real Altium boards:
+```bash
+python tests/test_pcbsight.py
 ```
-All tests assert dimensions, layer stacks, tracks, silkscreen markings, clearance rules, violations, and BOM integrity.
