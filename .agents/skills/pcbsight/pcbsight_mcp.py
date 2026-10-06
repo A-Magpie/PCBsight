@@ -1,7 +1,7 @@
 """
 pcbsight_mcp.py - Model Context Protocol (MCP) Server for PCBsight.
 Provides first-class executable tools for AI coding assistants (ChatGPT, OpenAI Codex, Claude Code, Antigravity).
-Implements standard JSON-RPC 2.0 over stdio without external dependencies.
+Supports both standard stdio transport and HTTP transport without external dependencies.
 """
 
 from __future__ import annotations
@@ -9,6 +9,8 @@ import sys
 import os
 import json
 import traceback
+import argparse
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # Ensure scripts directory and vendor are in sys.path
 _base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -23,8 +25,7 @@ try:
     from pcbdoc_parser import PCBDocParser
     from pcb_analyzer import PCBAnalyzer
     from pcb_reporter import PcbReporter
-except ImportError as e:
-    # Try relative import from skills directory
+except ImportError:
     _skill_scripts = os.path.join(_base_dir, "skills", "pcbsight", "scripts")
     if os.path.exists(_skill_scripts) and _skill_scripts not in sys.path:
         sys.path.insert(0, _skill_scripts)
@@ -190,15 +191,96 @@ def handle_tool_call(name: str, args: dict) -> str:
         raise ValueError(f"Unknown tool name: {name}")
 
 
-def send_response(response: dict):
-    body = json.dumps(response, ensure_ascii=False)
-    sys.stdout.write(body + "\n")
-    sys.stdout.flush()
+def process_mcp_message(req: dict) -> dict | None:
+    """Process a standard JSON-RPC 2.0 MCP request and return the response dictionary."""
+    req_id = req.get("id")
+    method = req.get("method")
+    params = req.get("params", {})
+
+    if method == "initialize":
+        return {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {
+                    "tools": {}
+                },
+                "serverInfo": {
+                    "name": "pcbsight-mcp",
+                    "version": "1.0.0"
+                }
+            }
+        }
+
+    elif method == "notifications/initialized":
+        return None
+
+    elif method == "ping":
+        return {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {}
+        }
+
+    elif method == "tools/list":
+        return {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "tools": TOOLS
+            }
+        }
+
+    elif method == "tools/call":
+        tool_name = params.get("name")
+        tool_args = params.get("arguments", {})
+        try:
+            result_text = handle_tool_call(tool_name, tool_args)
+            return {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": result_text
+                        }
+                    ]
+                }
+            }
+        except Exception as e:
+            err_msg = f"{type(e).__name__}: {str(e)}\n{traceback.format_exc()}"
+            return {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": {
+                    "isError": True,
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": err_msg
+                        }
+                    ]
+                }
+            }
+
+    else:
+        if req_id is not None:
+            return {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "error": {
+                    "code": -32601,
+                    "message": f"Method not found: {method}"
+                }
+            }
+        return None
 
 
-def run_mcp_server():
-    """Run JSON-RPC 2.0 loop reading from stdin."""
-    sys.stderr.write("PCBsight MCP server starting...\n")
+def run_stdio_server():
+    """Run JSON-RPC 2.0 loop reading from stdin and writing to stdout."""
+    sys.stderr.write("PCBsight MCP stdio server starting...\n")
     sys.stderr.flush()
 
     while True:
@@ -209,11 +291,9 @@ def run_mcp_server():
         if not line:
             continue
 
-        # Handle optional Content-Length prefix if present
         if line.lower().startswith("content-length:"):
             try:
                 length = int(line.split(":", 1)[1].strip())
-                # Read until empty line
                 while True:
                     hdr = sys.stdin.readline().strip()
                     if not hdr:
@@ -229,90 +309,69 @@ def run_mcp_server():
             except json.JSONDecodeError:
                 continue
 
-        req_id = req.get("id")
-        method = req.get("method")
-        params = req.get("params", {})
+        resp = process_mcp_message(req)
+        if resp is not None:
+            sys.stdout.write(json.dumps(resp, ensure_ascii=False) + "\n")
+            sys.stdout.flush()
 
-        if method == "initialize":
-            send_response({
+
+class McpHttpHandler(BaseHTTPRequestHandler):
+    """HTTP handler supporting JSON-RPC POST requests for remote cloud MCP deployments."""
+
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        status_info = {
+            "status": "healthy",
+            "service": "pcbsight-mcp",
+            "version": "1.0.0",
+            "tools": [t["name"] for t in TOOLS]
+        }
+        self.wfile.write(json.dumps(status_info, indent=2).encode("utf-8"))
+
+    def do_POST(self):
+        content_len = int(self.headers.get("Content-Length", 0))
+        post_data = self.rfile.read(content_len)
+        try:
+            req = json.loads(post_data.decode("utf-8"))
+            resp = process_mcp_message(req)
+            if resp is None:
+                resp = {"jsonrpc": "2.0", "result": "acknowledged"}
+            status_code = 200
+        except Exception as e:
+            status_code = 400
+            resp = {
                 "jsonrpc": "2.0",
-                "id": req_id,
-                "result": {
-                    "protocolVersion": "2024-11-05",
-                    "capabilities": {
-                        "tools": {}
-                    },
-                    "serverInfo": {
-                        "name": "pcbsight-mcp",
-                        "version": "1.0.0"
-                    }
-                }
-            })
+                "error": {"code": -32700, "message": f"Parse error: {e}"}
+            }
 
-        elif method == "notifications/initialized":
-            # Notification only, no response required
-            pass
+        self.send_response(status_code)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(json.dumps(resp, ensure_ascii=False).encode("utf-8"))
 
-        elif method == "ping":
-            send_response({
-                "jsonrpc": "2.0",
-                "id": req_id,
-                "result": {}
-            })
 
-        elif method == "tools/list":
-            send_response({
-                "jsonrpc": "2.0",
-                "id": req_id,
-                "result": {
-                    "tools": TOOLS
-                }
-            })
-
-        elif method == "tools/call":
-            tool_name = params.get("name")
-            tool_args = params.get("arguments", {})
-            try:
-                result_text = handle_tool_call(tool_name, tool_args)
-                send_response({
-                    "jsonrpc": "2.0",
-                    "id": req_id,
-                    "result": {
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": result_text
-                            }
-                        ]
-                    }
-                })
-            except Exception as e:
-                err_msg = f"{type(e).__name__}: {str(e)}\n{traceback.format_exc()}"
-                send_response({
-                    "jsonrpc": "2.0",
-                    "id": req_id,
-                    "result": {
-                        "isError": True,
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": err_msg
-                            }
-                        ]
-                    }
-                })
-
-        else:
-            if req_id is not None:
-                send_response({
-                    "jsonrpc": "2.0",
-                    "id": req_id,
-                    "error": {
-                        "code": -32601,
-                        "message": f"Method not found: {method}"
-                    }
-                })
+def run_http_server(host: str = "0.0.0.0", port: int = 8000):
+    """Run lightweight HTTP server for remote cloud MCP hosting."""
+    server = HTTPServer((host, port), McpHttpHandler)
+    print(f"PCBsight MCP HTTP Server running on http://{host}:{port}/mcp")
+    print(f"Exposing {len(TOOLS)} tools: {[t['name'] for t in TOOLS]}")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        server.server_close()
+        print("\nServer stopped.")
 
 
 if __name__ == "__main__":
-    run_mcp_server()
+    parser = argparse.ArgumentParser(description="PCBsight MCP Server")
+    parser.add_argument("--http", action="store_true", help="Run as remote HTTP server instead of stdio")
+    parser.add_argument("--host", default="0.0.0.0", help="HTTP server host (default: 0.0.0.0)")
+    parser.add_argument("--port", type=int, default=8000, help="HTTP server port (default: 8000)")
+    args = parser.parse_args()
+
+    if args.http:
+        run_http_server(args.host, args.port)
+    else:
+        run_stdio_server()
